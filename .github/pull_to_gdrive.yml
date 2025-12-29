@@ -28,7 +28,7 @@ jobs:
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
         run: |
-          python download_new.py
+          python download.py
 
       - name: Install rclone
         run: |
