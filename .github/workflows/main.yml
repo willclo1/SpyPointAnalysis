@@ -40,9 +40,8 @@ jobs:
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
-
       - name: Upload images to Google Drive folder
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          rclone copy images "gdrive:{${GDRIVE_FOLDER_ID}}" --create-empty-src-dirs -v
+          rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
