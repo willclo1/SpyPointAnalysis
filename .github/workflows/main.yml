@@ -2,7 +2,7 @@ name: Pull SPYPOINT photos to Google Drive
 
 on:
   schedule:
-    - cron: "15 11 * * *"   # runs daily at 11:15 UTC (~6:15am CT)
+    - cron: "15 11 * * *"   # daily 11:15 UTC (~6:15am CT)
   workflow_dispatch:
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyspypoint requests
+          pip install pyspypoint requests google-cloud-vision
 
       - name: Download new SPYPOINT photos
         env:
@@ -29,6 +29,16 @@ jobs:
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
         run: |
           python download.py
+
+      - name: Write Google Vision credentials
+        run: |
+          echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
+
+      - name: Run Vision OCR -> CSV
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+        run: |
+          python run_vision_ocr_folder.py
 
       - name: Install rclone
         run: |
@@ -40,8 +50,10 @@ jobs:
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
-      - name: Upload images to Google Drive folder
+
+      - name: Upload images + CSV to Google Drive folder
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+          rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
+          rclone copy stamp_data.csv gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
