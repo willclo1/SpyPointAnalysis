@@ -23,21 +23,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-py311-
 
-      # System deps needed when ONNX falls back to source build
+      # System deps (fine to keep)
       - name: Install system deps (protoc for onnx)
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
 
       - name: Install Python dependencies
+        env:
+          # IMPORTANT: prevent any source builds for onnx
+          PIP_ONLY_BINARY: "onnx"
         run: |
           python -m pip install --upgrade pip setuptools wheel
+
+          # Spypoint + OCR deps
           pip install pyspypoint requests google-cloud-vision
-          pip install megadetector speciesnet opencv-python pillow numpy pandas
+          pip install opencv-python pillow numpy pandas
+
+          # ✅ Force ONNX to be a wheel (prevents the broken source build)
+          pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5"
+
+          # Now install these (they will reuse the already-installed onnx wheel)
+          pip install megadetector speciesnet
 
       - name: Download new SPYPOINT photos
         env:
