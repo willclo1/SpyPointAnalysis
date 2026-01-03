@@ -85,10 +85,13 @@ jobs:
           # SPECIESNET_ADMIN1: "TX"
         run: |
           python run_events_append.py
-
-      - name: Upload images + events.csv to Google Drive folder
+          
+      - name: Upload images + events files to Google Drive folder
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
+
+          # upload both (tsv opens cleanly in Sheets)
           rclone copyto events.csv "gdrive:events.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+          rclone copyto events.tsv "gdrive:events.tsv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
