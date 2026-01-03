@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Cache pip downloads to speed up installs
+      # Cache pip downloads
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -27,37 +27,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-py311-
 
-      # System deps (fine to keep; useful if anything ever needs protoc)
-      - name: Install system deps (protoc)
+      # System deps (safe to keep)
+      - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+
       - name: Install Python dependencies
         env:
-          # prevent source builds for problem packages
           PIP_ONLY_BINARY: "onnx,blake3,cryptography,cffi,pyopenssl,asn1crypto"
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
+          # Core
           pip install pyspypoint requests google-cloud-vision
           pip install opencv-python pillow numpy pandas
-    
+
+          # Force wheels (no source builds)
           pip install --only-binary=:all: "protobuf<5"
           pip install --only-binary=:all: "onnx==1.16.2"
-      
+
           pip install --only-binary=:all: "cffi>=1.16.0"
           pip install --only-binary=:all: "cryptography>=41.0.0"
           pip install --only-binary=:all: "pyOpenSSL>=23.2.0"
           pip install --only-binary=:all: "asn1crypto==1.5.1"
-      
           pip install --only-binary=:all: "blake3==1.0.7"
-      
-          pip install --use-feature=fast-deps megadetector speciesnet
 
-      - name: Verify wheels installed (sanity check)
-        run: |
-          python -c "import onnx; print('onnx', onnx.__version__)"
-          python -c "import blake3; print('blake3 ok', getattr(blake3,'__version__','(no __version__)'))"
+          # Vision models
+          pip install --use-feature=fast-deps megadetector speciesnet
 
       - name: Download new SPYPOINT photos
         env:
@@ -81,26 +78,24 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      # Pull existing master events table (if it exists)
       - name: Download existing events.csv from Drive (if exists)
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-      # Run OCR + MegaDetector + SpeciesNet, append/dedupe into events.csv
-      - name: Run full recognition -> events.csv (append)
+      - name: Run OCR + detection -> events.csv (append)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
         run: |
           python run_events_append.py
 
-      - name: Upload images + events.csv to Google Drive folder
+      - name: Upload images + events.csv to Google Drive
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          # images: do not duplicate
+          # images: no duplicates
           rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
 
-          # events.csv: overwrite master table
+          # csv: overwrite master
           rclone copyto events.csv "gdrive:events.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
