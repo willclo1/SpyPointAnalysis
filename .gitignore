@@ -3,4 +3,4 @@ stamp_data.csv
 .DS_Store
 __pycache__
 images/
-
+.venv/
