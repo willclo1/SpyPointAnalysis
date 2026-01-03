@@ -32,27 +32,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
-
       - name: Install Python dependencies
         env:
-          # Prevent source builds for the two problem children
-          PIP_ONLY_BINARY: "onnx,blake3"
+          # prevent source builds for problem packages
+          PIP_ONLY_BINARY: "onnx,blake3,cryptography,cffi,pyopenssl,asn1crypto"
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
-          # Core deps
           pip install pyspypoint requests google-cloud-vision
           pip install opencv-python pillow numpy pandas
-
-          # ✅ Force wheels (NO SOURCE BUILDS)
-          # ONNX: keep pinned to a wheel-friendly version
-          pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5"
-
-          # blake3: force the cp311 manylinux wheel so pip never tries Rust builds
+    
+          pip install --only-binary=:all: "protobuf<5"
+          pip install --only-binary=:all: "onnx==1.16.2"
+      
+          pip install --only-binary=:all: "cffi>=1.16.0"
+          pip install --only-binary=:all: "cryptography>=41.0.0"
+          pip install --only-binary=:all: "pyOpenSSL>=23.2.0"
+          pip install --only-binary=:all: "asn1crypto==1.5.1"
+      
           pip install --only-binary=:all: "blake3==1.0.7"
-
-          # Now install these (they should reuse onnx + blake3 wheels)
-          pip install megadetector speciesnet
+      
+          pip install --use-feature=fast-deps megadetector speciesnet
 
       - name: Verify wheels installed (sanity check)
         run: |
