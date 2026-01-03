@@ -34,12 +34,6 @@ jobs:
         run: |
           echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
 
-      - name: Run Vision OCR -> CSV
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
-        run: |
-          python run_vision_ocr_folder.py
-
       - name: Install rclone
         run: |
           curl -fsSL https://rclone.org/install.sh | sudo bash
@@ -51,9 +45,25 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
+
+      - name: Download existing stamp_data.csv from Drive (if exists)
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone copy "gdrive:stamp_data.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
+
+      - name: Run Vision OCR -> CSV (append)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+        run: |
+          python run_vision_ocr_folder.py
+
       - name: Upload images + CSV to Google Drive folder
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
+          # images: do not duplicate
           rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
-          rclone copy stamp_data.csv gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+
+          # csv: overwrite the master file so it keeps growing
+          rclone copyto stamp_data.csv "gdrive:stamp_data.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
