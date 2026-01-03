@@ -1,0 +1,15 @@
+pyspypoint
+requests
+google-cloud-vision
+
+opencv-python
+pillow
+numpy
+pandas
+
+# Force modern ONNX wheel
+onnx==1.16.2
+protobuf<5
+
+megadetector
+speciesnet
