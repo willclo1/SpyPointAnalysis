@@ -1,26 +1,27 @@
 import csv
+import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Dict, List
 
-import cv2
-from megadetector.detection.run_detector import load_detector, run_detector
-from speciesnet import SpeciesNetClassifier
+import cv2  # still used for reading images if you want to extend later
 
 from vision_ocr import ocr_spypoint_stamp_vision
 
 IMAGES_DIR = Path("images")
 OUT_CSV = Path("events.csv")
+SPECIESNET_JSON = Path("speciesnet-results.json")
 
 UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING") == "1"
 
-# thresholds
-MD_ANIMAL_THRESH = 0.20
-MD_PERSON_THRESH = 0.30
-MD_VEHICLE_THRESH = 0.30
+# thresholds (detections come from SpeciesNet's detector output)
+ANIMAL_THRESH = 0.20
+HUMAN_THRESH = 0.30
+VEHICLE_THRESH = 0.30
 
 CAT_ANIMAL = "1"
-CAT_PERSON = "2"
+CAT_HUMAN = "2"
 CAT_VEHICLE = "3"
 
 
@@ -47,60 +48,90 @@ def write_csv(csv_path: Path, rows: List[Dict[str, str]]):
         w.writerows(rows)
 
 
-def crop(img, bbox_xywh):
-    h, w = img.shape[:2]
-    x, y, bw, bh = bbox_xywh
-    x0, y0 = int(x * w), int(y * h)
-    x1, y1 = int((x + bw) * w), int((y + bh) * h)
-    return img[max(0,y0):min(h,y1), max(0,x0):min(w,x1)]
+def run_speciesnet(images_dir: Path, out_json: Path):
+    """
+    Runs SpeciesNet on a folder and writes predictions JSON.
+    Uses optional env vars for geofencing:
+      SPECIESNET_COUNTRY (e.g. USA)
+      SPECIESNET_ADMIN1  (e.g. TX)
+    """
+    cmd = [
+        "python", "-m", "speciesnet.scripts.run_model",
+        "--folders", str(images_dir),
+        "--predictions_json", str(out_json),
+    ]
+
+    country = os.environ.get("SPECIESNET_COUNTRY", "").strip()
+    admin1 = os.environ.get("SPECIESNET_ADMIN1", "").strip()
+
+    if country:
+        cmd += ["--country", country]
+    if admin1:
+        cmd += ["--admin1_region", admin1]
+
+    subprocess.run(cmd, check=True)
 
 
 def main():
     if not IMAGES_DIR.exists():
         raise SystemExit("Missing images folder")
 
-    existing = load_existing(OUT_CSV)
+    # Run SpeciesNet once for the whole folder
+    run_speciesnet(IMAGES_DIR, SPECIESNET_JSON)
 
-    detector = load_detector("MDV6")
-    sn = SpeciesNetClassifier()
+    with SPECIESNET_JSON.open("r") as f:
+        sn = json.load(f)
+
+    preds = sn.get("predictions", [])
+    by_filename = {}
+    for p in preds:
+        fp = p.get("filepath", "")
+        if not fp:
+            continue
+        by_filename[Path(fp).name] = p
+
+    existing = load_existing(OUT_CSV)
 
     added, updated = 0, 0
 
-    for p in sorted(IMAGES_DIR.glob("*.jpg")):
-        fn = p.name
+    for img_path in sorted(IMAGES_DIR.glob("*.jpg")):
+        fn = img_path.name
+
         if fn in existing and not UPDATE_EXISTING:
             continue
 
-        stamp = ocr_spypoint_stamp_vision(str(p))
-        img = cv2.imread(str(p))
+        stamp = ocr_spypoint_stamp_vision(str(img_path))
 
-        md = run_detector(detector, str(p), quiet=True)
-        dets = md.get("detections", [])
+        pred = by_filename.get(fn, {})
+        dets = pred.get("detections", []) or []
 
-        animal_dets = [d for d in dets if d["category"] == CAT_ANIMAL and d["conf"] >= MD_ANIMAL_THRESH]
-        person_dets = [d for d in dets if d["category"] == CAT_PERSON and d["conf"] >= MD_PERSON_THRESH]
-        vehicle_dets = [d for d in dets if d["category"] == CAT_VEHICLE and d["conf"] >= MD_VEHICLE_THRESH]
+        animal_dets = [d for d in dets if d.get("category") == CAT_ANIMAL and float(d.get("conf", 0.0)) >= ANIMAL_THRESH]
+        human_dets = [d for d in dets if d.get("category") == CAT_HUMAN and float(d.get("conf", 0.0)) >= HUMAN_THRESH]
+        vehicle_dets = [d for d in dets if d.get("category") == CAT_VEHICLE and float(d.get("conf", 0.0)) >= VEHICLE_THRESH]
 
         has_animal = bool(animal_dets)
-        has_person = bool(person_dets)
+        has_person = bool(human_dets)
         has_vehicle = bool(vehicle_dets)
 
-        animal_conf = max([d["conf"] for d in animal_dets], default=0.0)
+        animal_conf = max([float(d.get("conf", 0.0)) for d in animal_dets], default=0.0)
 
-        species = ""
-        species_conf = ""
-        species_top3 = ""
+        # SpeciesNet final ensemble prediction + score
+        species = pred.get("prediction", "") or ""
+        species_conf_val = pred.get("prediction_score", None)
+        species_conf = "" if species_conf_val is None else f"{float(species_conf_val):.3f}"
 
-        if has_animal and img is not None:
-            best = max(animal_dets, key=lambda d: d["conf"])
-            crop_img = crop(img, best["bbox"])
-            crop_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+        # Top-3 from raw classifier output (if present)
+        cls = pred.get("classifications", {}) or {}
+        classes = cls.get("classes", []) or []
+        scores = cls.get("scores", []) or []
 
-            preds = sn.classify(crop_rgb, top_k=3)
-            if preds:
-                species = preds[0]["species"]
-                species_conf = f"{preds[0]['score']:.3f}"
-                species_top3 = ";".join(f"{p['species']}:{p['score']:.3f}" for p in preds)
+        top3 = []
+        for c, s in list(zip(classes, scores))[:3]:
+            try:
+                top3.append(f"{c}:{float(s):.3f}")
+            except Exception:
+                top3.append(f"{c}:{s}")
+        species_top3 = ";".join(top3)
 
         row = {
             "filename": fn,
@@ -108,17 +139,20 @@ def main():
             "time": stamp.time_hhmm_ampm or "",
             "temp_f": "" if stamp.temp_f is None else str(stamp.temp_f),
             "temp_c": "" if stamp.temp_c is None else str(stamp.temp_c),
+
             "has_animal": str(has_animal).lower(),
             "animal_conf": f"{animal_conf:.3f}",
             "has_person": str(has_person).lower(),
             "has_vehicle": str(has_vehicle).lower(),
+
             "species": species,
             "species_conf": species_conf,
             "species_top3": species_top3,
         }
 
+        was_existing = fn in existing
         existing[fn] = row
-        if fn in existing:
+        if was_existing:
             updated += 1
         else:
             added += 1
@@ -132,3 +166,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
