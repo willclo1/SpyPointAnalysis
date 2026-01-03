@@ -12,11 +12,6 @@ OUT_CSV = Path("events.csv")
 OUT_TSV = Path("events.tsv")
 SPECIESNET_JSON = Path("speciesnet-results.json")
 
-# ✅ Add taxonomy file (commit this into your repo)
-# Download once:
-#   curl -L -o speciesnet_taxonomy.json https://raw.githubusercontent.com/google/cameratrapai/main/speciesnet/data/taxonomy.json
-TAXONOMY_JSON = Path("speciesnet_taxonomy.json")
-
 UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING") == "1"
 
 # thresholds (detections come from SpeciesNet output)
@@ -27,7 +22,6 @@ VEHICLE_THRESH = 0.30
 CAT_ANIMAL = "1"
 CAT_HUMAN = "2"
 CAT_VEHICLE = "3"
-
 
 FIELDS = [
     "filename",
@@ -56,6 +50,18 @@ FIELDS = [
 ]
 
 
+def last_after_semicolon(label: str) -> str:
+    """
+    If label is like 'id;tax;tax;white_tailed_deer', returns 'white tailed deer'.
+    If no semicolon, returns label as-is.
+    """
+    if not label:
+        return ""
+    s = str(label).strip()
+    last = s.rsplit(";", 1)[-1].strip()
+    return last.replace("_", " ")
+
+
 def load_existing(csv_path: Path) -> Dict[str, Dict[str, str]]:
     """
     Loads existing rows keyed by filename. Handles both old and new schemas gracefully.
@@ -81,7 +87,7 @@ def write_table(path: Path, rows: List[Dict[str, str]], delimiter: str):
             f,
             fieldnames=FIELDS,
             delimiter=delimiter,
-            quoting=csv.QUOTE_MINIMAL
+            quoting=csv.QUOTE_MINIMAL,
         )
         w.writeheader()
         for r in rows:
@@ -113,46 +119,6 @@ def run_speciesnet(images_dir: Path, out_json: Path):
     subprocess.run(cmd, check=True)
 
 
-# ✅ Taxonomy loading + mapping (IDs -> human-readable labels)
-def load_taxonomy_map(taxonomy_path: Path) -> Dict[str, str]:
-    """
-    Builds an id -> label mapping from SpeciesNet taxonomy.json.
-
-    Preference order:
-      common_name > scientific_name > name > id
-    """
-    if not taxonomy_path.exists():
-        # If taxonomy isn't present, we still run, but you'll see IDs.
-        return {}
-
-    with taxonomy_path.open("r") as f:
-        data = json.load(f)
-
-    mapping: Dict[str, str] = {}
-
-    # taxonomy.json from cameratrapai/speciesnet uses a "nodes" array
-    for node in data.get("nodes", []) or []:
-        node_id = node.get("id")
-        if not node_id:
-            continue
-
-        label = (
-            node.get("common_name")
-            or node.get("scientific_name")
-            or node.get("name")
-            or node_id
-        )
-        mapping[str(node_id)] = str(label)
-
-    return mapping
-
-
-def map_label(raw: str, taxonomy: Dict[str, str]) -> str:
-    if not raw:
-        return ""
-    return taxonomy.get(raw, raw)
-
-
 def max_conf_for_category(dets: List[dict], category: str) -> float:
     vals = [float(d.get("conf", 0.0)) for d in dets if d.get("category") == category]
     return max(vals, default=0.0)
@@ -178,10 +144,10 @@ def pick_event_type(animal_c: float, human_c: float, vehicle_c: float) -> str:
     return candidates[0][0]
 
 
-def extract_top3(pred: dict, taxonomy: Dict[str, str]) -> List[Tuple[str, str]]:
+def extract_top3(pred: dict) -> List[Tuple[str, str]]:
     """
     Returns up to 3 (label, conf_string) tuples from SpeciesNet classifications, if present.
-    Converts taxonomy IDs to readable names if taxonomy is available.
+    Converts 'a;b;c;white_tailed_deer' -> 'white tailed deer'
     """
     cls = pred.get("classifications", {}) or {}
     classes = cls.get("classes", []) or []
@@ -189,7 +155,7 @@ def extract_top3(pred: dict, taxonomy: Dict[str, str]) -> List[Tuple[str, str]]:
 
     out: List[Tuple[str, str]] = []
     for c, s in list(zip(classes, scores))[:3]:
-        label = map_label(str(c), taxonomy)
+        label = last_after_semicolon(c)
         try:
             out.append((label, f"{float(s):.3f}"))
         except Exception:
@@ -200,9 +166,6 @@ def extract_top3(pred: dict, taxonomy: Dict[str, str]) -> List[Tuple[str, str]]:
 def main():
     if not IMAGES_DIR.exists():
         raise SystemExit("Missing images folder")
-
-    # ✅ Load taxonomy mapping (if file is present)
-    taxonomy = load_taxonomy_map(TAXONOMY_JSON)
 
     # Run SpeciesNet once for the whole folder
     run_speciesnet(IMAGES_DIR, SPECIESNET_JSON)
@@ -240,13 +203,13 @@ def main():
 
         # SpeciesNet final ensemble prediction + score (meaningful for animals)
         raw_species = pred.get("prediction", "") or ""
-        species = map_label(raw_species, taxonomy)
+        species = last_after_semicolon(raw_species)
 
         score_val = pred.get("prediction_score", None)
         species_conf = "" if score_val is None else f"{float(score_val):.3f}"
 
-        # Top 3 (ID -> label)
-        top3 = extract_top3(pred, taxonomy)
+        # Top 3 (take only last part after final ';')
+        top3 = extract_top3(pred)
         while len(top3) < 3:
             top3.append(("", ""))
 
