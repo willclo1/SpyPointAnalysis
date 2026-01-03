@@ -27,34 +27,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-py311-
 
-      # System deps (safe to keep)
+      # System deps (fine to keep)
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (pinned to avoid backtracking/builds)
         env:
-          PIP_ONLY_BINARY: "onnx,blake3,cryptography,cffi,pyopenssl,asn1crypto"
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
         run: |
           python -m pip install --upgrade pip setuptools wheel
 
-          # Core
-          pip install pyspypoint requests google-cloud-vision
-          pip install opencv-python pillow numpy pandas
+          # ---- Create constraints to stop pip from trying 20 versions ----
+          cat > constraints.txt <<'EOF'
+          protobuf<5
+          onnx==1.16.2
+          blake3==1.0.8
+          asn1crypto==1.5.1
+          cryptography>=41.0.0
+          cffi>=1.16.0
+          pyOpenSSL>=23.2.0
+          EOF
 
-          # Force wheels (no source builds)
-          pip install --only-binary=:all: "protobuf<5"
-          pip install --only-binary=:all: "onnx==1.16.2"
+          # ---- Core deps ----
+          pip install --only-binary=:all: -c constraints.txt \
+            requests google-cloud-vision opencv-python pillow numpy pandas
 
-          pip install --only-binary=:all: "cffi>=1.16.0"
-          pip install --only-binary=:all: "cryptography>=41.0.0"
-          pip install --only-binary=:all: "pyOpenSSL>=23.2.0"
-          pip install --only-binary=:all: "asn1crypto==1.5.1"
-          pip install --only-binary=:all: "blake3==1.0.7"
+          # ---- Spypoint lib (leave as-is; this is what worked for you) ----
+          pip install pyspypoint
 
-          # Vision models
-          pip install --use-feature=fast-deps megadetector speciesnet
+          # ---- Force ONNX + protobuf wheel first ----
+          pip install --only-binary=:all: -c constraints.txt onnx protobuf
+
+          # ---- Install the wildlife stack using constraints (prevents the freeze) ----
+          pip install -c constraints.txt megadetector speciesnet
 
       - name: Download new SPYPOINT photos
         env:
@@ -78,24 +86,26 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
+      # Pull existing master events table (if it exists)
       - name: Download existing events.csv from Drive (if exists)
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-      - name: Run OCR + detection -> events.csv (append)
+      # Run OCR + MegaDetector + SpeciesNet, append/dedupe into events.csv
+      - name: Run full recognition -> events.csv (append)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
         run: |
           python run_events_append.py
 
-      - name: Upload images + events.csv to Google Drive
+      - name: Upload images + events.csv to Google Drive folder
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          # images: no duplicates
+          # images: do not duplicate
           rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
 
-          # csv: overwrite master
+          # events.csv: overwrite master table
           rclone copyto events.csv "gdrive:events.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
