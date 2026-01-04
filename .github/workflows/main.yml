@@ -79,7 +79,6 @@ jobs:
 
       - name: Run SpeciesNet + OCR -> events.csv (append)
         env:
-          UPDATE_EXISTING: "1"
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
           # Optional: if you want geofencing to improve accuracy:
           SPECIESNET_COUNTRY: "USA"
