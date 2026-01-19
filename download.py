@@ -3,6 +3,11 @@ from pathlib import Path
 import requests
 import spypoint
 
+CAMERA_NAME_MAP = {
+    "64d2308abdc2af72ebb0e44b": "gate",
+    "696d50430049dd29d16b3c5f": "feeder",
+}
+
 OUT_DIR = Path("images")
 STATE_PATH = Path("state.json")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -29,13 +34,12 @@ def download(url: str, out_path: Path) -> None:
     out_path.write_bytes(r.content)
 
 def camera_display_name(cam) -> str:
-    # Try common attributes from different pyspypoint versions
-    for attr in ("name", "label", "display_name", "cameraName", "nickname"):
-        val = getattr(cam, attr, None)
-        if val:
-            return str(val)
-    cam_id = getattr(cam, "id", None) or getattr(cam, "camera_id", None) or "camera"
-    return str(cam_id)
+    cam_id = (
+        getattr(cam, "id", None)
+        or getattr(cam, "camera_id", None)
+        or str(cam)
+    )
+    return CAMERA_NAME_MAP.get(str(cam_id), str(cam_id))
 
 def main():
     email = os.environ.get("SPYPOINT_EMAIL")
@@ -48,6 +52,9 @@ def main():
 
     c = spypoint.Client(email, password)
     cams = c.cameras()
+    print("Camera count:", len(cams))
+    for cam in cams:
+        print("cam:", camera_display_name(cam), "id:", getattr(cam, "id", None))
 
     downloaded = 0
 
