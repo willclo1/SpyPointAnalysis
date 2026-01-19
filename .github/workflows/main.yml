@@ -82,6 +82,7 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
           # Optional: if you want geofencing to improve accuracy:
+          UPDATE_EXISTING: "1"
           SPECIESNET_COUNTRY: "USA"
           # SPECIESNET_ADMIN1: "TX"
         run: |
