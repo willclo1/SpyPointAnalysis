@@ -48,6 +48,17 @@ jobs:
 
           # SpeciesNet (includes detector outputs for animal/human/vehicle)
           pip install speciesnet
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           
       - name: Download new SPYPOINT photos
         env:
@@ -60,17 +71,6 @@ jobs:
       - name: Write Google Vision credentials
         run: |
           echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
-
-      - name: Install rclone
-        run: |
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-
-      - name: Configure rclone
-        env:
-          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
-        run: |
-          mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
       - name: Download existing events.csv from Drive (if exists)
         env:
