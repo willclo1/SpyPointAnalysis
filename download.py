@@ -6,6 +6,7 @@ import spypoint
 CAMERA_NAME_MAP = {
     "64d2308abdc2af72ebb0e44b": "gate",
     "696d50430049dd29d16b3c5f": "feeder",
+    "696e3766f762a13e8e9526ab": "ravine",
 }
 
 OUT_DIR = Path("images")
