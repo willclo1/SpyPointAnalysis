@@ -49,6 +49,11 @@ jobs:
           # SpeciesNet (includes detector outputs for animal/human/vehicle)
           pip install speciesnet
 
+      - name: Full reset
+        run: |
+          rm -rf images
+          rm -f events.csv events.tsv speciesnet-results.json
+          
       - name: Download new SPYPOINT photos
         env:
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
