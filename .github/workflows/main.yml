@@ -48,14 +48,15 @@ jobs:
 
           # SpeciesNet (includes detector outputs for animal/human/vehicle)
           pip install speciesnet
-
+          
       - name: Download new SPYPOINT photos
         env:
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           python download.py
-
+        
       - name: Write Google Vision credentials
         run: |
           echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
