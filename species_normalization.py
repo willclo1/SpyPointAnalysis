@@ -52,8 +52,7 @@ JUNK_VALUES = {
     "", " ", "nan", "none", "null", "nil", "n/a", "na", "-", "--", "?", "unknown", "unidentified",
     "blank", "no cv result", "no_cv_result", "nocvresult", "no result", "no_detection", "no detection",
     "empty", "none detected", "nothing", "nothing detected", "not sure", "unsure",
-    "background", "motion blur", "false positive", "false alarm", "trigger", "wind", "grass",
- controlled
+    "background", "motion blur", "false positive", "false alarm", "trigger", "wind", "grass"
 }
 
 # Some model outputs that are "too broad" to show as a species
