@@ -12,8 +12,8 @@ OUT_DIR = Path("images")
 STATE_PATH = Path("state.json")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-POLL_LIMIT   = 50      # how many recent photos per camera to look at each run
-MAX_PER_RUN  = 25      # safety cap total per run (across cameras)
+POLL_LIMIT   = 200      # how many recent photos per camera to look at each run
+MAX_PER_RUN  = 1000      # safety cap total per run (across cameras)
 SLEEP_SEC    = 1.0     # pause between downloads
 
 def safe_filename(name: str) -> str:
