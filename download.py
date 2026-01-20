@@ -17,8 +17,8 @@ CAMERA_NAME_MAP = {
 }
 
 # --- Tuning (tight scope) ---
-POLL_LIMIT = 120          # how far back to look PER CAMERA
-MAX_NEW_PER_RUN = 90      # max NEW images we will download+upload per run (across cameras)
+POLL_LIMIT = 300          # how far back to look PER CAMERA
+MAX_NEW_PER_RUN = 500      # max NEW images we will download+upload per run (across cameras)
 SLEEP_SEC = 0.2           # gentle throttle between downloads
 
 # Full resync mode:
