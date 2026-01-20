@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,9 +21,13 @@ POLL_LIMIT = 120          # how far back to look PER CAMERA
 MAX_NEW_PER_RUN = 90      # max NEW images we will download+upload per run (across cameras)
 SLEEP_SEC = 0.2           # gentle throttle between downloads
 
+# Full resync mode:
+# - FULL_REDOWNLOAD=1 will download/upload everything in the POLL_LIMIT window,
+#   ignoring Drive-existence checks (but still dedupes within this run).
+FULL_REDOWNLOAD = os.environ.get("FULL_REDOWNLOAD") == "1"
+
 # Local temp download staging (runner is ephemeral anyway)
 OUT_DIR = Path("images")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def safe_name(s: str) -> str:
@@ -94,7 +99,6 @@ def drive_existing_filenames(root_folder_id: str, cam_folder: str) -> set[str]:
 
     existing = set()
     for it in items:
-        # rclone returns {"Name": "...", "Size": ..., "IsDir": false, ...}
         name = it.get("Name")
         is_dir = it.get("IsDir", False)
         if name and not is_dir:
@@ -127,6 +131,17 @@ def upload_to_drive(local_path: Path, root_folder_id: str, cam_folder: str, file
     )
 
 
+def prepare_local_dirs():
+    """
+    On a GitHub runner, images/ might not exist.
+    If FULL_REDOWNLOAD is enabled, wipe images/ so we start clean locally.
+    """
+    if FULL_REDOWNLOAD and OUT_DIR.exists():
+        print("[MODE] FULL_REDOWNLOAD=1 -> wiping local images/ staging dir")
+        shutil.rmtree(OUT_DIR)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def main():
     email = os.environ.get("SPYPOINT_EMAIL")
     password = os.environ.get("SPYPOINT_PASSWORD")
@@ -138,6 +153,8 @@ def main():
     if not root_folder_id:
         raise SystemExit("Set GDRIVE_FOLDER_ID env var (Drive folder that holds your camera folders).")
 
+    prepare_local_dirs()
+
     c = spypoint.Client(email, password)
     cams = c.cameras()
 
@@ -147,11 +164,19 @@ def main():
         print("cam:", cam_folder_name(cam), "id:", cam_id)
 
     # Build a Drive index of existing filenames per camera folder
+    # Skip this entirely in FULL_REDOWNLOAD mode (tighter + faster).
     existing_by_cam: dict[str, set[str]] = {}
-    for cam in cams:
-        folder = safe_name(cam_folder_name(cam))
-        existing_by_cam[folder] = drive_existing_filenames(root_folder_id, folder)
-        print(f"[Drive] {folder}: {len(existing_by_cam[folder])} files indexed")
+    if not FULL_REDOWNLOAD:
+        for cam in cams:
+            folder = safe_name(cam_folder_name(cam))
+            existing_by_cam[folder] = drive_existing_filenames(root_folder_id, folder)
+            print(f"[Drive] {folder}: {len(existing_by_cam[folder])} files indexed")
+    else:
+        print("[MODE] FULL_REDOWNLOAD=1 -> not indexing Drive. Will re-upload within window.")
+        for cam in cams:
+            folder = safe_name(cam_folder_name(cam))
+            # keep an empty set so the rest of the code can reference it
+            existing_by_cam[folder] = set()
 
     new_uploaded = 0
     inspected = 0
@@ -168,17 +193,17 @@ def main():
             url = p.url()
             filename = spypoint_photo_filename(p)
 
-            # If it already exists in Drive, skip (does NOT count against MAX_NEW_PER_RUN)
-            if filename in existing_by_cam[folder]:
+            # Normal mode: skip if already in Drive (does NOT count against MAX_NEW_PER_RUN)
+            if not FULL_REDOWNLOAD and filename in existing_by_cam[folder]:
                 skipped_existing += 1
                 continue
 
-            # Download locally
+            # Local staging path
             cam_dir = OUT_DIR / folder
             cam_dir.mkdir(parents=True, exist_ok=True)
             out_path = cam_dir / filename
 
-            # Even though runner is fresh, this avoids duplicate within-run downloads
+            # Dedupe within-run downloads (even in FULL_REDOWNLOAD)
             if out_path.exists():
                 continue
 
@@ -194,17 +219,18 @@ def main():
             existing_by_cam[folder].add(filename)
 
             new_uploaded += 1
-            print(f"[NEW] Uploaded: {folder}/{filename} (new_uploaded={new_uploaded})")
+            mode_tag = "REUP" if FULL_REDOWNLOAD else "NEW"
+            print(f"[{mode_tag}] Uploaded: {folder}/{filename} (uploaded={new_uploaded})")
 
             if new_uploaded >= MAX_NEW_PER_RUN:
                 print(f"Reached MAX_NEW_PER_RUN={MAX_NEW_PER_RUN}. Stopping.")
-                print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  NewUploaded={new_uploaded}")
+                print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  Uploaded={new_uploaded}")
                 return
 
             time.sleep(SLEEP_SEC)
 
     print("Done.")
-    print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  NewUploaded={new_uploaded}")
+    print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  Uploaded={new_uploaded}")
 
 
 if __name__ == "__main__":
