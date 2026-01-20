@@ -5,10 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-from species_normalization import (
-    normalize_species_label_to_broad,
-    choose_best_species_label,
-)
+from species_normalization import normalize_species, normalize_event_type
 from vision_ocr import ocr_spypoint_stamp_vision
 
 IMAGES_DIR = Path("images")
@@ -23,13 +20,12 @@ ANIMAL_THRESH = 0.20
 HUMAN_THRESH = 0.30
 VEHICLE_THRESH = 0.30
 
-# label category ids from SpeciesNet detections
 CAT_ANIMAL = "1"
 CAT_HUMAN = "2"
 CAT_VEHICLE = "3"
 
-# for picking species label
-SPECIES_STRONG_THRESH = float(os.environ.get("SPECIES_STRONG_THRESH", "0.60"))
+# your rule
+SPECIES_PICK_CONF = 0.60
 
 FIELDS = [
     "camera",
@@ -44,8 +40,8 @@ FIELDS = [
     "human_conf",
     "vehicle_conf",
 
-    "species",         # raw model label (human-readable-ish)
-    "species_clean",   # ✅ broad normalized label used by dashboard
+    "species",
+    "species_clean",
     "species_conf",
 
     "top1_species",
@@ -72,6 +68,7 @@ def row_key(camera: str, filename: str) -> str:
 def load_existing(csv_path: Path) -> Dict[str, Dict[str, str]]:
     if not csv_path.exists():
         return {}
+
     rows: Dict[str, Dict[str, str]] = {}
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -99,12 +96,15 @@ def run_speciesnet(images_dir: Path, out_json: Path):
         "--folders", str(images_dir),
         "--predictions_json", str(out_json),
     ]
+
     country = os.environ.get("SPECIESNET_COUNTRY", "").strip()
     admin1 = os.environ.get("SPECIESNET_ADMIN1", "").strip()
+
     if country:
         cmd += ["--country", country]
     if admin1:
         cmd += ["--admin1_region", admin1]
+
     subprocess.run(cmd, check=True)
 
 
@@ -133,34 +133,66 @@ def pick_event_type(animal_c: float, human_c: float, vehicle_c: float) -> str:
     return candidates[0][0]
 
 
-def extract_top3(pred: dict) -> List[Tuple[str, Optional[float]]]:
-    """
-    Returns up to 3 (label, conf_float) from SpeciesNet classifications if present.
-    """
+def extract_top3(pred: dict) -> List[Tuple[str, str]]:
     cls = pred.get("classifications", {}) or {}
     classes = cls.get("classes", []) or []
     scores = cls.get("scores", []) or []
 
-    out: List[Tuple[str, Optional[float]]] = []
+    out: List[Tuple[str, str]] = []
     for c, s in list(zip(classes, scores))[:3]:
         label = last_after_semicolon(c)
         try:
-            conf = float(s)
+            out.append((label, f"{float(s):.3f}"))
         except Exception:
-            conf = None
-        out.append((label, conf))
-    while len(out) < 3:
-        out.append(("", None))
+            out.append((label, str(s)))
     return out
 
 
-def fmt3(x: Optional[float]) -> str:
+def _to_float(x: Optional[str]) -> Optional[float]:
     if x is None:
-        return ""
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
     try:
-        return f"{float(x):.3f}"
+        return float(s)
     except Exception:
-        return ""
+        return None
+
+
+def choose_best_species_label(
+    event_type: str,
+    species: str,
+    species_conf: Optional[float],
+    top3: List[Tuple[str, str]],
+) -> Tuple[str, Optional[float]]:
+    """
+    Your rule:
+    - If species OR top1/top2/top3 has confidence >= 0.60, use the best one.
+    - Otherwise keep species as-is (it will likely normalize to a broad class or Other).
+    """
+    if event_type != "animal":
+        return event_type, None
+
+    candidates: List[Tuple[str, float]] = []
+
+    if species and species_conf is not None:
+        candidates.append((species, species_conf))
+
+    for (lab, conf_s) in top3[:3]:
+        c = _to_float(conf_s)
+        if lab and c is not None:
+            candidates.append((lab, c))
+
+    # Only accept confident candidates
+    confident = [(lab, c) for (lab, c) in candidates if c >= SPECIES_PICK_CONF]
+
+    if confident:
+        confident.sort(key=lambda x: x[1], reverse=True)
+        return confident[0][0], confident[0][1]
+
+    # fallback: original prediction label
+    return species, species_conf
 
 
 def main():
@@ -174,7 +206,6 @@ def main():
 
     preds = sn.get("predictions", []) or []
 
-    # Map predictions by relative path from IMAGES_DIR
     by_relpath: Dict[str, dict] = {}
     for p in preds:
         fp = p.get("filepath", "") or ""
@@ -184,6 +215,7 @@ def main():
             rel = Path(fp).resolve().relative_to(IMAGES_DIR.resolve())
             by_relpath[str(rel)] = p
         except Exception:
+            # last resort
             by_relpath[Path(fp).name] = p
 
     existing = load_existing(OUT_CSV)
@@ -209,45 +241,45 @@ def main():
 
         event_type = pick_event_type(animal_conf, human_conf, vehicle_conf)
 
-        # raw prediction label + score
+        # Base predicted label + score
         raw_species = pred.get("prediction", "") or ""
         species = last_after_semicolon(raw_species)
 
         score_val = pred.get("prediction_score", None)
-        try:
-            species_pred_conf = float(score_val) if score_val is not None else None
-        except Exception:
-            species_pred_conf = None
+        species_conf_f: Optional[float] = None
+        if score_val is not None:
+            try:
+                species_conf_f = float(score_val)
+            except Exception:
+                species_conf_f = None
 
-        # top3
+        # Top3
         top3 = extract_top3(pred)
+        while len(top3) < 3:
+            top3.append(("", ""))
 
-        # Decide the best label to use for CLEAN species (only meaningful for animals)
+        # If non-animal, overwrite labels consistently
+        if event_type in ("human", "vehicle"):
+            species = event_type
+            species_conf_f = human_conf if event_type == "human" else vehicle_conf
+            top3 = [("", ""), ("", ""), ("", "")]
+        elif event_type == "blank":
+            species = ""
+            species_conf_f = None
+            top3 = [("", ""), ("", ""), ("", "")]
+
+        # Choose best label using your 0.60 rule (animal only)
+        chosen_label, chosen_conf = choose_best_species_label(event_type, species, species_conf_f, top3)
+
+        # Normalize to broad, stable categories
         if event_type == "animal":
-            chosen_label, chosen_conf, chosen_src = choose_best_species_label(
-                prediction_label=species,
-                prediction_conf=species_pred_conf,
-                topk=top3,
-                strong_thresh=SPECIES_STRONG_THRESH,
-            )
-            species_clean = normalize_species_label_to_broad(chosen_label)
-            # store confidence in species_conf as the confidence of the chosen label
-            species_conf = fmt3(chosen_conf)
+            species_clean = normalize_species(chosen_label)
         elif event_type == "human":
             species_clean = "Human"
-            species_conf = fmt3(human_conf)
         elif event_type == "vehicle":
             species_clean = "Vehicle"
-            species_conf = fmt3(vehicle_conf)
         else:
             species_clean = "Other"
-            species_conf = ""
-
-        # normalize top1/top2/top3 labels too (broad classes) if you want them cleaner
-        # (optional but makes debugging/secondary charts nicer)
-        top1_label, top1_conf = top3[0]
-        top2_label, top2_conf = top3[1]
-        top3_label, top3_conf = top3[2]
 
         row = {
             "camera": camera,
@@ -262,24 +294,25 @@ def main():
             "human_conf": f"{human_conf:.3f}",
             "vehicle_conf": f"{vehicle_conf:.3f}",
 
+            # keep raw species (human/vehicle/blank overwritten above)
             "species": species,
             "species_clean": species_clean,
-            "species_conf": species_conf,
 
-            "top1_species": last_after_semicolon(top1_label),
-            "top1_conf": fmt3(top1_conf),
-            "top2_species": last_after_semicolon(top2_label),
-            "top2_conf": fmt3(top2_conf),
-            "top3_species": last_after_semicolon(top3_label),
-            "top3_conf": fmt3(top3_conf),
+            # keep original species_conf (for debugging) + also chosen conf if you want
+            "species_conf": "" if species_conf_f is None else f"{species_conf_f:.3f}",
+
+            "top1_species": top3[0][0],
+            "top1_conf": top3[0][1],
+            "top2_species": top3[1][0],
+            "top2_conf": top3[1][1],
+            "top3_species": top3[2][0],
+            "top3_conf": top3[2][1],
         }
 
         was_existing = key in existing
         existing[key] = row
-        if was_existing:
-            updated += 1
-        else:
-            added += 1
+        updated += 1 if was_existing else 0
+        added += 0 if was_existing else 1
 
     def _sort_key(k: str):
         cam, fn = k.split("::", 1)
