@@ -1,32 +1,43 @@
 """
 species_normalization.py
 
-Central Texas Ranch (La Grange / Fayette County) species normalization.
+Central Texas ranch normalization (La Grange / Fayette County).
+
+We produce TWO outputs:
+- species_clean: a readable animal label (ex: "Raven", "White-tailed Deer")
+- species_group: a broader bucket (ex: "Birds", "Deer", "Predators", "Other")
 
 Design goals:
-- "Presentation ready" categories for a ranch dashboard (clear, consistent, not overly detailed).
-- Never leak junk labels into the UI (blank/no cv result/animal/bird/canis species/corvus species/etc).
-- Consolidate synonyms/misspellings into canonical labels.
-- Provide a simple grouping for charts (Deer, Hogs, Predators, Birds, Livestock, Small Mammals, Reptiles, Domestic, Other).
-
-Usage:
-    from species_normalization import normalize_species, normalize_event_type
-    species_clean, species_group = normalize_species(raw_label)
+- Stable labels for charts (not taxonomy strings, not model artifacts)
+- Avoid "bird/animal/corvus species" showing up as species
+- Prefer useful broad-ish IDs a rancher cares about (Deer/Hogs/Coyote/Raven/etc.)
+- Domestic dog can be treated as "Other" (configurable)
 """
 
 from __future__ import annotations
-
-import re
+from dataclasses import dataclass
 from typing import Optional, Tuple
+import re
 
+
+# -----------------------------
+# Tuning knobs
+# -----------------------------
+# If you want dogs to never appear as a species in the dashboard:
+HIDE_DOMESTIC_DOG = True
+
+
+# -----------------------------
+# Basic cleaning
+# -----------------------------
 _WS_RE = re.compile(r"\s+")
-_PUNCT_RE = re.compile(r"[^a-z0-9\s\-]")
+_PUNCT_RE = re.compile(r"[^a-z0-9\s\-']")
 
-def _clean_basic(raw: str) -> str:
+def clean_label(raw: Optional[str]) -> str:
     s = (raw or "").strip().lower()
     if not s:
         return ""
-    # SpeciesNet taxonomy: "a;b;c;white_tailed_deer"
+    # SpeciesNet taxonomy-style strings: "a;b;c;white_tailed_deer"
     if ";" in s:
         s = s.split(";")[-1].strip()
     s = s.replace("_", " ")
@@ -34,320 +45,174 @@ def _clean_basic(raw: str) -> str:
     s = _WS_RE.sub(" ", s).strip()
     return s
 
-def _title(s: str) -> str:
-    # title-case but keep hyphenated words readable
-    return " ".join(part.capitalize() for part in s.split(" "))
+
+def title(s: str) -> str:
+    return " ".join(w.capitalize() for w in s.split())
+
 
 # -----------------------------
-# Junk / artifact values
+# Junk + broad outputs we never want as species
 # -----------------------------
-JUNK_VALUES = {
-    "", " ", "nan", "none", "null", "nil", "n/a", "na", "-", "--", "?", "unknown", "unidentified",
-    "blank", "no cv result", "no_cv_result", "nocvresult", "no result", "no_detection", "no detection",
-    "empty", "none detected", "nothing", "nothing detected", "not sure", "unsure",
-    "background", "motion blur", "false positive", "false alarm", "trigger", "wind", "grass",
+JUNK = {
+    "", "nan", "none", "null", "n/a", "na", "-", "--", "?", "unknown",
+    "blank", "no cv result", "no result", "no detection", "none detected",
+    "background", "false positive", "false alarm", "trigger",
 }
 
-# Too broad to display as a "species" label
-BROAD_LABELS = {
-    "animal", "other animal", "mammal",
-    "bird", "small bird", "songbird",
-    "reptile", "amphibian", "fish",
-    "rodent", "insect", "arthropod",
-    "wildlife", "vertebrate",
-    # vague taxonomy placeholders we see in real outputs
-    "canis species", "corvus species", "buteo species",
+# Too broad for species_clean (these should become Other unless we find a better candidate)
+BROAD = {
+    "animal", "wildlife", "mammal", "bird", "reptile", "amphibian", "fish",
+    "rodent", "canid", "felid", "insect", "arthropod",
+    "corvus species", "canis species", "vulpes species", "buteo species",
     "hawk species", "owl species", "snake species", "lizard species",
     "duck species", "goose species", "sparrow species", "blackbird species",
+    "dove species", "pigeon species",
 }
 
+
 # -----------------------------
-# Canonical label map (broad ranch-friendly)
-# keys are pre-cleaned lowercase
+# Canonical species + groups
+# (keys must be CLEANED via clean_label)
 # -----------------------------
-CANONICAL = {
-    # Human / vehicle defensive (if they slip in)
-    "human": "Human",
-    "person": "Human",
-    "people": "Human",
+@dataclass(frozen=True)
+class Canon:
+    name: str
+    group: str
 
-    "vehicle": "Vehicle",
-    "car": "Vehicle",
-    "truck": "Vehicle",
-    "pickup": "Vehicle",
-    "pickup truck": "Vehicle",
-    "suv": "Vehicle",
-    "van": "Vehicle",
-    "atv": "Vehicle",
-    "utv": "Vehicle",
-    "side by side": "Vehicle",
-    "side-by-side": "Vehicle",
-    "tractor": "Vehicle",
-
-    # Deer (TX)
-    "white tailed deer": "White-tailed Deer",
-    "white tail deer": "White-tailed Deer",
-    "whitetail deer": "White-tailed Deer",
-    "whitetail": "White-tailed Deer",
-    "buck": "White-tailed Deer",
-    "doe": "White-tailed Deer",
-    "fawn": "White-tailed Deer",
-    "odocoileus virginianus": "White-tailed Deer",
-    "deer": "White-tailed Deer",
-
-    "axis deer": "Axis Deer",
-    "axis": "Axis Deer",
-    "chital": "Axis Deer",
-
-    "fallow deer": "Fallow Deer",
-    "sika deer": "Sika Deer",
-    "mule deer": "Mule Deer",
-
-    # Hogs
-    "feral hog": "Feral Hog",
-    "wild hog": "Feral Hog",
-    "wild pig": "Feral Hog",
-    "feral pig": "Feral Hog",
-    "hog": "Feral Hog",
-    "boar": "Feral Hog",
-    "sow": "Feral Hog",
-    "pig": "Feral Hog",
-    "sus scrofa": "Feral Hog",
-
-    # Predators
-    "coyote": "Coyote",
-    "canis latrans": "Coyote",
-
-    "gray fox": "Gray Fox",
-    "grey fox": "Gray Fox",
-    "red fox": "Red Fox",
-    "fox": "Fox",
-
-    "bobcat": "Bobcat",
-    "lynx rufus": "Bobcat",
-
-    "mountain lion": "Mountain Lion",
-    "cougar": "Mountain Lion",
-    "puma": "Mountain Lion",
-
-    # Small mammals
-    "raccoon": "Raccoon",
-    "opossum": "Opossum",
-    "possum": "Opossum",
-    "skunk": "Skunk",
-    "armadillo": "Armadillo",
-    "nine banded armadillo": "Armadillo",
-    "rabbit": "Rabbit",
-    "cottontail": "Rabbit",
-    "jackrabbit": "Jackrabbit",
-    "squirrel": "Squirrel",
-
-    # Livestock / domestic
-    "cow": "Cattle",
-    "cattle": "Cattle",
-    "bull": "Cattle",
-    "calf": "Cattle",
-    "goat": "Goat",
-    "sheep": "Sheep",
-    "horse": "Horse",
-    "donkey": "Donkey",
-    "mule": "Mule",
-
-    "domestic dog": "Domestic Dog",
-    "dog": "Domestic Dog",
-    "domestic cat": "Domestic Cat",
-    "cat": "Domestic Cat",
-
-    # Birds (keep broad but useful)
-    "common raven": "Raven",
-    "raven": "Raven",
-    "american crow": "Crow",
-    "crow": "Crow",
-    "turkey vulture": "Vulture",
-    "black vulture": "Vulture",
-    "vulture": "Vulture",
-    "red tailed hawk": "Hawk",
-    "hawk": "Hawk",
-    "owl": "Owl",
-    "wild turkey": "Wild Turkey",
-    "turkey": "Wild Turkey",
-    "dove": "Dove",
-    "quail": "Quail",
-    "roadrunner": "Roadrunner",
-
-    # Reptiles
-    "rattlesnake": "Rattlesnake",
-    "western diamondback rattlesnake": "Rattlesnake",
-    "cottonmouth": "Cottonmouth",
-    "water moccasin": "Cottonmouth",
-    "snake": "Snake",
-    "lizard": "Lizard",
-    "turtle": "Turtle",
-    "frog": "Frog",
-    "toad": "Toad",
-}
-
-# Canonical -> chart grouping
-GROUPS = {
+CANON = {
     # Deer
-    "White-tailed Deer": "Deer",
-    "Axis Deer": "Deer",
-    "Fallow Deer": "Deer",
-    "Sika Deer": "Deer",
-    "Mule Deer": "Deer",
+    "white tailed deer": Canon("White-tailed Deer", "Deer"),
+    "white tail deer": Canon("White-tailed Deer", "Deer"),
+    "whitetail": Canon("White-tailed Deer", "Deer"),
+    "whitetail deer": Canon("White-tailed Deer", "Deer"),
+    "buck": Canon("White-tailed Deer", "Deer"),
+    "doe": Canon("White-tailed Deer", "Deer"),
+    "fawn": Canon("White-tailed Deer", "Deer"),
+    "odocoileus virginianus": Canon("White-tailed Deer", "Deer"),
 
     # Hogs
-    "Feral Hog": "Hogs",
+    "feral hog": Canon("Feral Hog", "Hogs"),
+    "wild hog": Canon("Feral Hog", "Hogs"),
+    "hog": Canon("Feral Hog", "Hogs"),
+    "boar": Canon("Feral Hog", "Hogs"),
+    "sow": Canon("Feral Hog", "Hogs"),
+    "wild pig": Canon("Feral Hog", "Hogs"),
+    "sus scrofa": Canon("Feral Hog", "Hogs"),
 
-    # Predators
-    "Coyote": "Predators",
-    "Fox": "Predators",
-    "Gray Fox": "Predators",
-    "Red Fox": "Predators",
-    "Bobcat": "Predators",
-    "Mountain Lion": "Predators",
+    # Predators / meso
+    "coyote": Canon("Coyote", "Predators"),
+    "canis latrans": Canon("Coyote", "Predators"),
 
-    # Small mammals / small game
-    "Raccoon": "Small Mammals",
-    "Opossum": "Small Mammals",
-    "Skunk": "Small Mammals",
-    "Armadillo": "Small Mammals",
-    "Rabbit": "Small Game",
-    "Jackrabbit": "Small Game",
-    "Squirrel": "Small Game",
+    "bobcat": Canon("Bobcat", "Predators"),
+    "lynx rufus": Canon("Bobcat", "Predators"),
 
-    # Birds
-    "Raven": "Birds",
-    "Crow": "Birds",
-    "Vulture": "Birds",
-    "Hawk": "Birds",
-    "Owl": "Birds",
-    "Wild Turkey": "Birds",
-    "Dove": "Birds",
-    "Quail": "Birds",
-    "Roadrunner": "Birds",
+    "mountain lion": Canon("Mountain Lion", "Predators"),
+    "cougar": Canon("Mountain Lion", "Predators"),
+    "puma": Canon("Mountain Lion", "Predators"),
+
+    "fox": Canon("Fox", "Predators"),
+    "gray fox": Canon("Gray Fox", "Predators"),
+    "grey fox": Canon("Gray Fox", "Predators"),
+    "red fox": Canon("Red Fox", "Predators"),
+
+    # Common ranch mammals
+    "raccoon": Canon("Raccoon", "Small Mammals"),
+    "opossum": Canon("Opossum", "Small Mammals"),
+    "possum": Canon("Opossum", "Small Mammals"),
+    "skunk": Canon("Skunk", "Small Mammals"),
+    "armadillo": Canon("Armadillo", "Small Mammals"),
+    "rabbit": Canon("Rabbit", "Small Mammals"),
+    "cottontail": Canon("Rabbit", "Small Mammals"),
+    "squirrel": Canon("Squirrel", "Small Mammals"),
+
+    # Birds (collapse to “Raven/Crow/Turkey/etc.” + group Birds)
+    "common raven": Canon("Raven", "Birds"),
+    "raven": Canon("Raven", "Birds"),
+    "american crow": Canon("Crow", "Birds"),
+    "crow": Canon("Crow", "Birds"),
+    "turkey vulture": Canon("Vulture", "Birds"),
+    "black vulture": Canon("Vulture", "Birds"),
+    "wild turkey": Canon("Wild Turkey", "Birds"),
+    "turkey": Canon("Wild Turkey", "Birds"),
+    "dove": Canon("Dove", "Birds"),
+    "mourning dove": Canon("Dove", "Birds"),
+    "roadrunner": Canon("Roadrunner", "Birds"),
+    "red tailed hawk": Canon("Hawk", "Birds"),
+    "hawk": Canon("Hawk", "Birds"),
+    "owl": Canon("Owl", "Birds"),
+    "egret": Canon("Wading Bird", "Birds"),
+    "heron": Canon("Wading Bird", "Birds"),
 
     # Reptiles
-    "Rattlesnake": "Reptiles",
-    "Cottonmouth": "Reptiles",
-    "Snake": "Reptiles",
-    "Lizard": "Reptiles",
-    "Turtle": "Reptiles",
-    "Frog": "Reptiles",
-    "Toad": "Reptiles",
+    "rattlesnake": Canon("Rattlesnake", "Reptiles"),
+    "western diamondback rattlesnake": Canon("Rattlesnake", "Reptiles"),
+    "cottonmouth": Canon("Cottonmouth", "Reptiles"),
+    "water moccasin": Canon("Cottonmouth", "Reptiles"),
+    "snake": Canon("Snake", "Reptiles"),
+    "turtle": Canon("Turtle", "Reptiles"),
+    "lizard": Canon("Lizard", "Reptiles"),
 
-    # Livestock
-    "Cattle": "Livestock",
-    "Goat": "Livestock",
-    "Sheep": "Livestock",
-    "Horse": "Livestock",
-    "Donkey": "Livestock",
-    "Mule": "Livestock",
+    # Domestic / livestock (optional to show)
+    "domestic cattle": Canon("Cattle", "Livestock"),
+    "cow": Canon("Cattle", "Livestock"),
+    "bull": Canon("Cattle", "Livestock"),
 
-    # Domestic
-    "Domestic Dog": "Domestic",
-    "Domestic Cat": "Domestic",
+    "horse": Canon("Horse", "Livestock"),
+    "goat": Canon("Goat", "Livestock"),
+    "sheep": Canon("Sheep", "Livestock"),
 
-    # Defensive
-    "Human": "Human",
-    "Vehicle": "Vehicle",
-    "Unknown": "Other",
-    "Other": "Other",
+    "domestic dog": Canon("Domestic Dog", "Domestic"),
+    "dog": Canon("Domestic Dog", "Domestic"),
+    "domestic cat": Canon("Domestic Cat", "Domestic"),
+    "cat": Canon("Domestic Cat", "Domestic"),
 }
 
-def normalize_event_type(raw: Optional[str]) -> str:
-    s = _clean_basic(str(raw or ""))
-    if not s or s in JUNK_VALUES:
-        return "blank"
-    if s in ("person", "people", "human"):
-        return "human"
-    if s in ("vehicle", "car", "truck", "atv", "utv", "tractor", "suv", "van"):
-        return "vehicle"
-    if s in ("animal", "wildlife", "mammal", "bird", "reptile", "amphibian"):
-        return "animal"
-    return s
+
+def is_junk_or_broad(cleaned: str) -> bool:
+    return (not cleaned) or (cleaned in JUNK) or (cleaned in BROAD)
+
 
 def normalize_species(raw: Optional[str]) -> Tuple[str, str]:
     """
-    Returns (species_clean, species_group)
-
-    - species_clean: canonical ranch-friendly label (e.g., "White-tailed Deer")
-    - species_group: broad grouping for charts (e.g., "Deer")
+    Returns (species_clean, species_group).
+    Always returns something safe for charts.
     """
-    s = _clean_basic(str(raw or ""))
+    s = clean_label(raw)
 
-    if not s or s in JUNK_VALUES or s in BROAD_LABELS:
-        return ("Unknown", "Other")
+    if not s or s in JUNK:
+        return ("Other", "Other")
 
-    # direct map
-    if s in CANONICAL:
-        c = CANONICAL[s]
-        return (c, GROUPS.get(c, "Other"))
+    if s in BROAD:
+        return ("Other", "Other")
 
-    # heuristics: keep broad, not subspecies
-    if "white" in s and "tail" in s and "deer" in s:
-        c = "White-tailed Deer"
-        return (c, GROUPS[c])
+    # Canonical mapping
+    if s in CANON:
+        canon = CANON[s]
+        if HIDE_DOMESTIC_DOG and canon.name == "Domestic Dog":
+            return ("Other", "Other")
+        return (canon.name, canon.group)
 
-    if "deer" in s:
-        # unknown deer/exotic - keep as "Deer" without over-detail
-        return ("Deer (Other)", "Deer")
-
-    if any(tok in s for tok in ("hog", "boar", "pig")):
-        c = "Feral Hog"
-        return (c, GROUPS[c])
-
+    # Heuristic consolidation (keeps things readable)
+    if ("white" in s and "tail" in s and "deer" in s) or s.endswith(" deer"):
+        return ("White-tailed Deer", "Deer")
+    if any(k in s for k in ("hog", "boar", "pig")):
+        return ("Feral Hog", "Hogs")
     if "coyote" in s:
-        c = "Coyote"
-        return (c, GROUPS[c])
-
-    if "bobcat" in s:
-        c = "Bobcat"
-        return (c, GROUPS[c])
-
-    if "raccoon" in s:
-        c = "Raccoon"
-        return (c, GROUPS[c])
-
-    if "opossum" in s or "possum" in s:
-        c = "Opossum"
-        return (c, GROUPS[c])
-
-    if "armadillo" in s:
-        c = "Armadillo"
-        return (c, GROUPS[c])
-
-    if "vulture" in s:
-        c = "Vulture"
-        return (c, GROUPS[c])
-
+        return ("Coyote", "Predators")
     if "raven" in s:
-        c = "Raven"
-        return (c, GROUPS[c])
-
+        return ("Raven", "Birds")
     if "crow" in s:
-        c = "Crow"
-        return (c, GROUPS[c])
-
+        return ("Crow", "Birds")
+    if "vulture" in s:
+        return ("Vulture", "Birds")
     if "hawk" in s:
-        c = "Hawk"
-        return (c, GROUPS[c])
-
+        return ("Hawk", "Birds")
     if "owl" in s:
-        c = "Owl"
-        return (c, GROUPS[c])
-
-    if "turkey" in s:
-        c = "Wild Turkey"
-        return (c, GROUPS[c])
-
+        return ("Owl", "Birds")
     if "snake" in s:
-        # consolidate to safe broad label
         if "rattle" in s or "diamond" in s:
-            c = "Rattlesnake"
-        else:
-            c = "Snake"
-        return (c, GROUPS[c])
+            return ("Rattlesnake", "Reptiles")
+        return ("Snake", "Reptiles")
 
-    # default: don't explode the dashboard with weird one-offs
-    return ("Other", "Other")
+    # If we don’t recognize it, keep it readable but bucket it as Other
+    return (title(s), "Other")
