@@ -1,34 +1,14 @@
-# run_events_append.py
-#
-# Builds / updates events.csv + events.tsv from images/<camera>/*.jpg
-# - Runs SpeciesNet over all images (including camera subfolders)
-# - OCRs the Spypoint stamp for date/time/temp
-# - Writes a clean "species_clean" field using species_normalization.normalize_species
-# - Keeps camera in a dedicated column
-# - Keys rows by camera::filename so multiple cameras can share filenames safely
-#
-# Expected folder layout:
-#   images/
-#     gate/
-#       PICT1234.jpg
-#     feeder/
-#       PICT5678.jpg
-#     ravine/
-#       ...
-#
-# Env:
-#   UPDATE_EXISTING=1   -> recompute rows even if already present
-#   SPECIESNET_COUNTRY=USA
-#   SPECIESNET_ADMIN1=TX   (optional)
-
 import csv
 import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
-from species_normalization import normalize_species
+from species_normalization import (
+    normalize_species_label_to_broad,
+    choose_best_species_label,
+)
 from vision_ocr import ocr_spypoint_stamp_vision
 
 IMAGES_DIR = Path("images")
@@ -43,52 +23,41 @@ ANIMAL_THRESH = 0.20
 HUMAN_THRESH = 0.30
 VEHICLE_THRESH = 0.30
 
+# label category ids from SpeciesNet detections
 CAT_ANIMAL = "1"
 CAT_HUMAN = "2"
 CAT_VEHICLE = "3"
 
+# for picking species label
+SPECIES_STRONG_THRESH = float(os.environ.get("SPECIES_STRONG_THRESH", "0.60"))
+
 FIELDS = [
-    # ✅ camera identity
     "camera",
-
-    # file identity
     "filename",
-
-    # OCR stamp
     "date",
     "time",
     "temp_f",
     "temp_c",
 
-    # event summary
-    "event_type",  # animal / human / vehicle / blank
+    "event_type",
     "animal_conf",
     "human_conf",
     "vehicle_conf",
 
-    # species prediction
-    "species",         # raw-ish label
-    "species_clean",   # ✅ normalized label for charts/filters
+    "species",         # raw model label (human-readable-ish)
+    "species_clean",   # ✅ broad normalized label used by dashboard
     "species_conf",
 
-    # top-3
     "top1_species",
-    "top1_species_clean",
     "top1_conf",
     "top2_species",
-    "top2_species_clean",
     "top2_conf",
     "top3_species",
-    "top3_species_clean",
     "top3_conf",
 ]
 
 
 def last_after_semicolon(label: str) -> str:
-    """
-    If label is like 'id;tax;tax;white_tailed_deer', returns 'white tailed deer'.
-    If no semicolon, returns label as-is.
-    """
     if not label:
         return ""
     s = str(label).strip()
@@ -97,18 +66,12 @@ def last_after_semicolon(label: str) -> str:
 
 
 def row_key(camera: str, filename: str) -> str:
-    """Unique key per event row to avoid filename collisions across cameras."""
     return f"{camera}::{filename}"
 
 
 def load_existing(csv_path: Path) -> Dict[str, Dict[str, str]]:
-    """
-    Loads existing rows keyed by (camera, filename).
-    Gracefully handles old schema that may not have 'camera' or 'species_clean'.
-    """
     if not csv_path.exists():
         return {}
-
     rows: Dict[str, Dict[str, str]] = {}
     with csv_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
@@ -117,61 +80,31 @@ def load_existing(csv_path: Path) -> Dict[str, Dict[str, str]]:
             cam = (r.get("camera") or "").strip() or "unknown"
             if not fn:
                 continue
-
             normalized = {k: (r.get(k, "") or "") for k in FIELDS}
-            # If older file didn't have species_clean, derive it now
-            if not normalized.get("species_clean"):
-                normalized["species_clean"] = normalize_species(normalized.get("species", ""))
-            # If top*_clean missing, derive as well
-            for i in (1, 2, 3):
-                raw = normalized.get(f"top{i}_species", "")
-                key_clean = f"top{i}_species_clean"
-                if key_clean in normalized and not normalized.get(key_clean):
-                    normalized[key_clean] = normalize_species(raw)
-
             rows[row_key(cam, fn)] = normalized
     return rows
 
 
 def write_table(path: Path, rows: List[Dict[str, str]], delimiter: str):
     with path.open("w", newline="") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=FIELDS,
-            delimiter=delimiter,
-            quoting=csv.QUOTE_MINIMAL,
-        )
+        w = csv.DictWriter(f, fieldnames=FIELDS, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL)
         w.writeheader()
         for r in rows:
             w.writerow({k: (r.get(k, "") or "") for k in FIELDS})
 
 
 def run_speciesnet(images_dir: Path, out_json: Path):
-    """
-    Runs SpeciesNet on a folder and writes predictions JSON.
-
-    Optional env vars (geofencing):
-      SPECIESNET_COUNTRY (e.g. USA)
-      SPECIESNET_ADMIN1  (e.g. TX)
-    """
     cmd = [
-        "python",
-        "-m",
-        "speciesnet.scripts.run_model",
-        "--folders",
-        str(images_dir),
-        "--predictions_json",
-        str(out_json),
+        "python", "-m", "speciesnet.scripts.run_model",
+        "--folders", str(images_dir),
+        "--predictions_json", str(out_json),
     ]
-
     country = os.environ.get("SPECIESNET_COUNTRY", "").strip()
     admin1 = os.environ.get("SPECIESNET_ADMIN1", "").strip()
-
     if country:
         cmd += ["--country", country]
     if admin1:
         cmd += ["--admin1_region", admin1]
-
     subprocess.run(cmd, check=True)
 
 
@@ -200,30 +133,40 @@ def pick_event_type(animal_c: float, human_c: float, vehicle_c: float) -> str:
     return candidates[0][0]
 
 
-def extract_top3(pred: dict) -> List[Tuple[str, str]]:
+def extract_top3(pred: dict) -> List[Tuple[str, Optional[float]]]:
     """
-    Returns up to 3 (label, conf_string) tuples from SpeciesNet classifications, if present.
-    Converts 'a;b;c;white_tailed_deer' -> 'white tailed deer'
+    Returns up to 3 (label, conf_float) from SpeciesNet classifications if present.
     """
     cls = pred.get("classifications", {}) or {}
     classes = cls.get("classes", []) or []
     scores = cls.get("scores", []) or []
 
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, Optional[float]]] = []
     for c, s in list(zip(classes, scores))[:3]:
         label = last_after_semicolon(c)
         try:
-            out.append((label, f"{float(s):.3f}"))
+            conf = float(s)
         except Exception:
-            out.append((label, str(s)))
+            conf = None
+        out.append((label, conf))
+    while len(out) < 3:
+        out.append(("", None))
     return out
+
+
+def fmt3(x: Optional[float]) -> str:
+    if x is None:
+        return ""
+    try:
+        return f"{float(x):.3f}"
+    except Exception:
+        return ""
 
 
 def main():
     if not IMAGES_DIR.exists():
         raise SystemExit("Missing images folder")
 
-    # Run SpeciesNet once for the whole folder (it will see subfolders too)
     run_speciesnet(IMAGES_DIR, SPECIESNET_JSON)
 
     with SPECIESNET_JSON.open("r") as f:
@@ -231,8 +174,7 @@ def main():
 
     preds = sn.get("predictions", []) or []
 
-    # Map predictions by relative path from IMAGES_DIR to avoid filename collisions
-    # Example key: "gate/IMG_123.jpg"
+    # Map predictions by relative path from IMAGES_DIR
     by_relpath: Dict[str, dict] = {}
     for p in preds:
         fp = p.get("filepath", "") or ""
@@ -242,84 +184,73 @@ def main():
             rel = Path(fp).resolve().relative_to(IMAGES_DIR.resolve())
             by_relpath[str(rel)] = p
         except Exception:
-            # Fallback: if paths are weird, at least store by basename
             by_relpath[Path(fp).name] = p
 
     existing = load_existing(OUT_CSV)
     added, updated = 0, 0
 
-    # Process recursively: images/<camera>/<file>.jpg
     for img_path in sorted(IMAGES_DIR.rglob("*.jpg")):
         fn = img_path.name
-
         camera = img_path.parent.name if img_path.parent != IMAGES_DIR else "unknown"
         key = row_key(camera, fn)
 
         if key in existing and not UPDATE_EXISTING:
             continue
 
-        # OCR stamp
         stamp = ocr_spypoint_stamp_vision(str(img_path))
 
-        # Match SpeciesNet by relative path
-        pred = {}
-        try:
-            rel_key = str(img_path.resolve().relative_to(IMAGES_DIR.resolve()))
-            pred = by_relpath.get(rel_key, {})
-        except Exception:
-            pred = by_relpath.get(fn, {})
-
+        rel_key = str(img_path.resolve().relative_to(IMAGES_DIR.resolve()))
+        pred = by_relpath.get(rel_key, {})
         dets = pred.get("detections", []) or []
+
         animal_conf = max_conf_for_category(dets, CAT_ANIMAL)
         human_conf = max_conf_for_category(dets, CAT_HUMAN)
         vehicle_conf = max_conf_for_category(dets, CAT_VEHICLE)
 
         event_type = pick_event_type(animal_conf, human_conf, vehicle_conf)
 
-        # Primary prediction (animals)
+        # raw prediction label + score
         raw_species = pred.get("prediction", "") or ""
         species = last_after_semicolon(raw_species)
 
         score_val = pred.get("prediction_score", None)
-        species_conf = "" if score_val is None else f"{float(score_val):.3f}"
+        try:
+            species_pred_conf = float(score_val) if score_val is not None else None
+        except Exception:
+            species_pred_conf = None
 
-        # Top 3 classes (animals)
+        # top3
         top3 = extract_top3(pred)
-        while len(top3) < 3:
-            top3.append(("", ""))
 
-        # Defaults for *_clean
-        species_clean = normalize_species(species)
-        top1_clean = normalize_species(top3[0][0])
-        top2_clean = normalize_species(top3[1][0])
-        top3_clean = normalize_species(top3[2][0])
-
-        # If it’s not an animal event, force human-friendly labels
-        if event_type in ("human", "vehicle"):
-            species = event_type
-            species_clean = "Person" if event_type == "human" else "Vehicle"
-            species_conf = f"{(human_conf if event_type == 'human' else vehicle_conf):.3f}"
-
-            top3 = [("", ""), ("", ""), ("", "")]
-            top1_clean = top2_clean = top3_clean = ""
-
-        elif event_type == "blank":
-            species = ""
+        # Decide the best label to use for CLEAN species (only meaningful for animals)
+        if event_type == "animal":
+            chosen_label, chosen_conf, chosen_src = choose_best_species_label(
+                prediction_label=species,
+                prediction_conf=species_pred_conf,
+                topk=top3,
+                strong_thresh=SPECIES_STRONG_THRESH,
+            )
+            species_clean = normalize_species_label_to_broad(chosen_label)
+            # store confidence in species_conf as the confidence of the chosen label
+            species_conf = fmt3(chosen_conf)
+        elif event_type == "human":
+            species_clean = "Human"
+            species_conf = fmt3(human_conf)
+        elif event_type == "vehicle":
+            species_clean = "Vehicle"
+            species_conf = fmt3(vehicle_conf)
+        else:
             species_clean = "Other"
             species_conf = ""
-            top3 = [("", ""), ("", ""), ("", "")]
-            top1_clean = top2_clean = top3_clean = ""
 
-        else:
-            # animal event but prediction empty: fallback to top1 if available
-            if not species and top3[0][0]:
-                species = top3[0][0]
-                species_conf = top3[0][1]
-                species_clean = normalize_species(species)
+        # normalize top1/top2/top3 labels too (broad classes) if you want them cleaner
+        # (optional but makes debugging/secondary charts nicer)
+        top1_label, top1_conf = top3[0]
+        top2_label, top2_conf = top3[1]
+        top3_label, top3_conf = top3[2]
 
         row = {
             "camera": camera,
-
             "filename": fn,
             "date": stamp.date_mmddyyyy or "",
             "time": stamp.time_hhmm_ampm or "",
@@ -335,17 +266,12 @@ def main():
             "species_clean": species_clean,
             "species_conf": species_conf,
 
-            "top1_species": top3[0][0],
-            "top1_species_clean": top1_clean,
-            "top1_conf": top3[0][1],
-
-            "top2_species": top3[1][0],
-            "top2_species_clean": top2_clean,
-            "top2_conf": top3[1][1],
-
-            "top3_species": top3[2][0],
-            "top3_species_clean": top3_clean,
-            "top3_conf": top3[2][1],
+            "top1_species": last_after_semicolon(top1_label),
+            "top1_conf": fmt3(top1_conf),
+            "top2_species": last_after_semicolon(top2_label),
+            "top2_conf": fmt3(top2_conf),
+            "top3_species": last_after_semicolon(top3_label),
+            "top3_conf": fmt3(top3_conf),
         }
 
         was_existing = key in existing
@@ -355,14 +281,12 @@ def main():
         else:
             added += 1
 
-    # Stable ordering: camera then filename
     def _sort_key(k: str):
         cam, fn = k.split("::", 1)
         return (cam, fn)
 
     all_rows = [existing[k] for k in sorted(existing.keys(), key=_sort_key)]
 
-    # Write both formats
     write_table(OUT_CSV, all_rows, delimiter=",")
     write_table(OUT_TSV, all_rows, delimiter="\t")
 
