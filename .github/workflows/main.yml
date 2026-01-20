@@ -65,6 +65,7 @@ jobs:
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          FULL_REDOWNLOAD: "1"
         run: |
           python download.py
         
