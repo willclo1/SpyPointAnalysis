@@ -1,28 +1,27 @@
 """
 species_normalization.py
 
-Central Texas Ranch (La Grange / Fayette County) species normalization.
+Central Texas Ranch (La Grange / Fayette County) normalization.
 
-Goal:
-- Convert messy model labels into stable, human-friendly categories for charts.
-- Ensure that blanks, overly broad terms, and CV artifacts do NOT appear in the UI.
-- Consolidate synonyms, scientific names, and common misspellings.
-
-Usage:
-    from species_normalization import normalize_species, normalize_vehicle_type, normalize_event_type
-
-    df["species_clean"] = df["species"].apply(normalize_species)
-    df["event_type_clean"] = df["event_type"].apply(normalize_event_type)
+Design goals:
+- Prefer a confident label (>= threshold) from prediction or top1/top2/top3.
+- Normalize to BROAD animal classes (no subspecies obsession).
+- Prevent junk labels from polluting the UI.
+- Treat domestic dogs as "Other" (per your request).
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
+from dataclasses import dataclass
+from typing import Optional, Tuple, Iterable
 import re
 
 
 # -----------------------------
-# Helpers
+# Config
 # -----------------------------
+DEFAULT_STRONG_THRESH = 0.60  # your requested threshold
+
 _WS_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[^a-z0-9\s\-]")
 
@@ -30,7 +29,7 @@ def _clean_basic(raw: str) -> str:
     s = (raw or "").strip().lower()
     if not s:
         return ""
-    # SpeciesNet often uses taxonomy strings: "a;b;c;white_tailed_deer"
+    # SpeciesNet taxonomy strings: "a;b;c;white_tailed_deer"
     if ";" in s:
         s = s.split(";")[-1].strip()
     s = s.replace("_", " ")
@@ -38,33 +37,37 @@ def _clean_basic(raw: str) -> str:
     s = _WS_RE.sub(" ", s).strip()
     return s
 
-
-def _title_case(s: str) -> str:
-    # Keep acronyms and hyphenated words decently readable
-    # e.g., "white-tailed deer" -> "White-Tailed Deer" (then we map it anyway)
-    return " ".join(w.capitalize() for w in s.split(" "))
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if not s:
+            return None
+        return float(s)
+    except Exception:
+        return None
 
 
 # -----------------------------
-# Garbage / pipeline artifacts
+# Junk / artifacts / too-broad
 # -----------------------------
 JUNK_VALUES = {
     "", " ", "nan", "none", "null", "nil", "n/a", "na", "-", "--", "?", "unknown", "unidentified",
     "blank", "no cv result", "no_cv_result", "nocvresult", "no result", "no_detection", "no detection",
     "empty", "none detected", "nothing", "nothing detected", "not sure", "unsure",
-    "background", "motion blur", "false positive", "false alarm", "trigger", "wind", "grass"
+    "background", "motion blur", "false positive", "false alarm", "trigger", "wind", "grass",
 }
 
-# Some model outputs that are "too broad" to show as a species
 BROAD_CATEGORIES = {
     "animal", "other animal", "mammal", "bird", "reptile", "amphibian", "fish",
     "rodent", "canid", "felid", "insect", "arthropod",
     "wildlife", "vertebrate",
 }
 
-# Sometimes taxonomy-y / placeholder-y labels show up
+# “too vague to be useful”
 BANNED_LABELS = {
-    "corvus species",  # too vague (crow/raven)
+    "corvus species",
     "canis species",
     "vulpes species",
     "buteo species",
@@ -82,15 +85,17 @@ BANNED_LABELS = {
     "pigeon species",
 }
 
+def _is_bad_label(s: str) -> bool:
+    return (not s) or (s in JUNK_VALUES) or (s in BROAD_CATEGORIES) or (s in BANNED_LABELS)
+
 
 # -----------------------------
-# Canonical mapping
-# keys must be pre-cleaned lowercase
+# Broad class mapping (what UI shows)
 # -----------------------------
-CANONICAL_SPECIES = {
-    # =========================
-    # HUMAN / VEHICLE DEFENSIVE
-    # =========================
+# Keys must be cleaned (lowercase, punctuation removed)
+# Values are the broad class labels you want in the UI.
+BROAD_MAP = {
+    # Humans / vehicles (defensive)
     "human": "Human",
     "person": "Human",
     "people": "Human",
@@ -112,39 +117,27 @@ CANONICAL_SPECIES = {
     "tractor": "Vehicle",
     "ranger": "Vehicle",
 
-    # =========================
-    # DEER
-    # =========================
-    "white tailed deer": "White-tailed Deer",
-    "white-tailed deer": "White-tailed Deer",
-    "white tail deer": "White-tailed Deer",
-    "whitetail deer": "White-tailed Deer",
-    "whitetailed deer": "White-tailed Deer",
-    "whitetail": "White-tailed Deer",
-    "deer": "White-tailed Deer",
-    "doe": "White-tailed Deer",
-    "buck": "White-tailed Deer",
-    "fawn": "White-tailed Deer",
-    "odocoileus virginianus": "White-tailed Deer",
+    # Deer (collapse all deer-ish variants)
+    "white tailed deer": "Deer",
+    "white-tailed deer": "Deer",
+    "white tail deer": "Deer",
+    "whitetail deer": "Deer",
+    "whitetailed deer": "Deer",
+    "whitetail": "Deer",
+    "deer": "Deer",
+    "doe": "Deer",
+    "buck": "Deer",
+    "fawn": "Deer",
+    "odocoileus virginianus": "Deer",
+    "mule deer": "Deer",
+    "odocoileus hemionus": "Deer",
+    "axis deer": "Deer",
+    "axis": "Deer",
+    "chital": "Deer",
+    "fallow deer": "Deer",
+    "sika deer": "Deer",
 
-    "mule deer": "Mule Deer",
-    "odocoileus hemionus": "Mule Deer",
-
-    # Exotics that sometimes appear in TX ranch country
-    "axis deer": "Axis Deer",
-    "axis": "Axis Deer",
-    "chital": "Axis Deer",
-    "axis axis": "Axis Deer",
-
-    "fallow deer": "Fallow Deer",
-    "dama dama": "Fallow Deer",
-
-    "sika deer": "Sika Deer",
-    "cervus nippon": "Sika Deer",
-
-    # =========================
-    # HOGS
-    # =========================
+    # Hogs
     "feral hog": "Feral Hog",
     "wild hog": "Feral Hog",
     "wild pig": "Feral Hog",
@@ -155,387 +148,201 @@ CANONICAL_SPECIES = {
     "pig": "Feral Hog",
     "sus scrofa": "Feral Hog",
 
-    # =========================
-    # COYOTE / FOX / CANIDS
-    # =========================
+    # Predators
     "coyote": "Coyote",
     "canis latrans": "Coyote",
-
-    "fox": "Fox",
-    "gray fox": "Gray Fox",
-    "grey fox": "Gray Fox",
-    "urocyon cinereoargenteus": "Gray Fox",
-    "red fox": "Red Fox",
-    "vulpes vulpes": "Red Fox",
-
-    "dog": "Domestic Dog",
-    "domestic dog": "Domestic Dog",
-    "canis lupus familiaris": "Domestic Dog",
-    "house dog": "Domestic Dog",
-    "pet dog": "Domestic Dog",
-    "stray dog": "Domestic Dog",
-
-    # =========================
-    # CATS
-    # =========================
-    "cat": "Domestic Cat",
-    "domestic cat": "Domestic Cat",
-    "house cat": "Domestic Cat",
-    "pet cat": "Domestic Cat",
-    "felis catus": "Domestic Cat",
-
     "bobcat": "Bobcat",
     "lynx rufus": "Bobcat",
-
     "mountain lion": "Mountain Lion",
     "cougar": "Mountain Lion",
     "puma": "Mountain Lion",
-    "puma concolor": "Mountain Lion",
 
-    # =========================
-    # RACCOON / OPOSSUM / SKUNK
-    # =========================
+    # Small mammals
     "raccoon": "Raccoon",
-    "procyon lotor": "Raccoon",
-
     "opossum": "Opossum",
     "possum": "Opossum",
-    "virginia opossum": "Opossum",
-    "didelphis virginiana": "Opossum",
-
     "skunk": "Skunk",
-    "striped skunk": "Skunk",
-    "mephitis mephitis": "Skunk",
-
-    # =========================
-    # ARMADILLO
-    # =========================
     "armadillo": "Armadillo",
-    "nine banded armadillo": "Armadillo",
-    "nine-banded armadillo": "Armadillo",
-    "dasypus novemcinctus": "Armadillo",
-
-    # =========================
-    # RABBITS / HARES
-    # =========================
     "rabbit": "Rabbit",
     "cottontail": "Rabbit",
     "eastern cottontail": "Rabbit",
-    "sylvilagus floridanus": "Rabbit",
-    "jackrabbit": "Jackrabbit",
-    "black tailed jackrabbit": "Jackrabbit",
-    "black-tailed jackrabbit": "Jackrabbit",
-    "lep us californicus": "Jackrabbit",
-
-    # =========================
-    # SQUIRRELS / RODENTS
-    # =========================
+    "jackrabbit": "Rabbit",
     "squirrel": "Squirrel",
-    "fox squirrel": "Fox Squirrel",
-    "eastern fox squirrel": "Fox Squirrel",
-    "sciurus niger": "Fox Squirrel",
-    "gray squirrel": "Gray Squirrel",
-    "grey squirrel": "Gray Squirrel",
 
-    "rat": "Rodent",
-    "mouse": "Rodent",
-    "rodent": "Rodent",
-
-    # =========================
-    # LIVESTOCK (common on ranches)
-    # =========================
+    # Livestock
     "cow": "Cattle",
     "cattle": "Cattle",
     "bull": "Cattle",
     "calf": "Cattle",
-    "heifer": "Cattle",
-    "steer": "Cattle",
-    "bos taurus": "Cattle",
-
-    "horse": "Horse",
-    "equus ferus caballus": "Horse",
-
     "goat": "Goat",
-    "domestic goat": "Goat",
-    "capra hircus": "Goat",
-
     "sheep": "Sheep",
-    "domestic sheep": "Sheep",
-    "ovis aries": "Sheep",
-
+    "horse": "Horse",
     "donkey": "Donkey",
-    "burro": "Donkey",
-    "equus africanus asinus": "Donkey",
-
     "mule": "Mule",
-
     "chicken": "Chicken",
-    "rooster": "Chicken",
-    "hen": "Chicken",
 
-    "turkey domestic": "Domestic Turkey",
-    "domestic turkey": "Domestic Turkey",
+    # Birds (collapse to “Bird” unless you want separate buckets)
+    "bird": "Bird",
+    "crow": "Bird",
+    "raven": "Bird",
+    "hawk": "Bird",
+    "owl": "Bird",
+    "vulture": "Bird",
+    "turkey": "Bird",
+    "wild turkey": "Bird",
+    "dove": "Bird",
+    "quail": "Bird",
+    "roadrunner": "Bird",
+    "woodpecker": "Bird",
 
-    # =========================
-    # OTHER MAMMALS COMMON IN TX
-    # =========================
-    "badger": "Badger",
-    "american badger": "Badger",
-
-    "beaver": "Beaver",
-    "north american beaver": "Beaver",
-
-    "otter": "Otter",
-    "river otter": "Otter",
-
-    "mink": "Mink",
-
-    "weasel": "Weasel",
-
-    "porcupine": "Porcupine",
-
-    "ringtail": "Ringtail",
-    "ring-tailed cat": "Ringtail",
-
-    "coati": "Coati",
-
-    # =========================
-    # BIRDS — ranch-relevant
-    # =========================
-    "raven": "Raven",
-    "common raven": "Raven",
-    "corvus corax": "Raven",
-
-    "crow": "Crow",
-    "american crow": "Crow",
-    "corvus brachyrhynchos": "Crow",
-
-    "vulture": "Vulture",
-    "turkey vulture": "Vulture",
-    "black vulture": "Vulture",
-
-    "hawk": "Hawk",
-    "red tailed hawk": "Hawk",
-    "red-tailed hawk": "Hawk",
-    "buteo jamaicensis": "Hawk",
-    "cooper hawk": "Hawk",
-    "cooper's hawk": "Hawk",
-
-    "eagle": "Eagle",
-    "bald eagle": "Eagle",
-
-    "owl": "Owl",
-    "great horned owl": "Owl",
-    "barred owl": "Owl",
-    "screech owl": "Owl",
-    "eastern screech owl": "Owl",
-
-    "turkey": "Wild Turkey",
-    "wild turkey": "Wild Turkey",
-    "meleagris gallopavo": "Wild Turkey",
-
-    "quail": "Quail",
-    "northern bobwhite": "Quail",
-    "bobwhite": "Quail",
-
-    "dove": "Dove",
-    "mourning dove": "Dove",
-    "white winged dove": "Dove",
-    "white-winged dove": "Dove",
-
-    "pigeon": "Pigeon",
-
-    "roadrunner": "Roadrunner",
-    "greater roadrunner": "Roadrunner",
-
-    "woodpecker": "Woodpecker",
-    "red bellied woodpecker": "Woodpecker",
-    "red-bellied woodpecker": "Woodpecker",
-
-    "blue jay": "Blue Jay",
-    "jay": "Blue Jay",
-
-    "cardinal": "Northern Cardinal",
-    "northern cardinal": "Northern Cardinal",
-
-    "mockingbird": "Northern Mockingbird",
-    "northern mockingbird": "Northern Mockingbird",
-
-    "sparrow": "Small Bird",
-    "songbird": "Small Bird",
-    "small bird": "Small Bird",
-    "bird": "Other",
-
-    "grackle": "Grackle",
-    "great tailed grackle": "Grackle",
-    "great-tailed grackle": "Grackle",
-
-    "blackbird": "Blackbird",
-    "red winged blackbird": "Blackbird",
-    "red-winged blackbird": "Blackbird",
-
-    "heron": "Heron",
-    "great blue heron": "Heron",
-
-    "egret": "Egret",
-
-    # =========================
-    # REPTILES / AMPHIBIANS
-    # =========================
+    # Reptiles
     "snake": "Snake",
-    "rattlesnake": "Rattlesnake",
-    "western diamondback": "Rattlesnake",
-    "western diamondback rattlesnake": "Rattlesnake",
-    "cottonmouth": "Cottonmouth",
-    "water moccasin": "Cottonmouth",
-
-    "lizard": "Lizard",
-    "gecko": "Lizard",
-    "anole": "Lizard",
-
+    "rattlesnake": "Snake",
+    "cottonmouth": "Snake",
+    "water moccasin": "Snake",
     "turtle": "Turtle",
-    "box turtle": "Turtle",
+    "lizard": "Lizard",
 
+    # Amphibians (rare)
     "frog": "Frog",
     "toad": "Toad",
-
-    # =========================
-    # INSECTS / VERY SMALL
-    # =========================
-    "insect": "Other",
-    "bug": "Other",
-    "spider": "Other",
-    "scorpion": "Other",
-
-    # =========================
-    # OTHER / FALLBACK-LIKE LABELS
-    # =========================
-    "other": "Other",
-    "unknown animal": "Other",
-    "unknown bird": "Other",
-    "unknown mammal": "Other",
-    "no animal": "Other",
 }
 
-
-# -----------------------------
-# Optional vehicle subtyping
-# (useful if you later add a vehicle classifier)
-# -----------------------------
-VEHICLE_ALIASES = {
-    "atv": "ATV",
-    "utv": "UTV",
-    "side by side": "UTV",
-    "side-by-side": "UTV",
-    "car": "Car",
-    "sedan": "Car",
-    "suv": "SUV",
-    "truck": "Truck",
-    "pickup": "Truck",
-    "pickup truck": "Truck",
-    "tractor": "Tractor",
-    "van": "Van",
+# Domestic dog handling (you said: disregard dogs)
+DOG_ALIASES = {
+    "dog", "domestic dog", "house dog", "pet dog", "stray dog", "canis lupus familiaris"
 }
-
-
-def normalize_vehicle_type(raw: Optional[str]) -> str:
-    s = _clean_basic(str(raw or ""))
-    if not s or s in JUNK_VALUES:
-        return "Other"
-    return VEHICLE_ALIASES.get(s, _title_case(s))
+CAT_ALIASES = {
+    "cat", "domestic cat", "house cat", "pet cat", "felis catus"
+}
 
 
 def normalize_event_type(raw: Optional[str]) -> str:
     s = _clean_basic(str(raw or ""))
-    if not s:
+    if not s or s in JUNK_VALUES:
         return "blank"
     if s in ("person", "human", "people"):
         return "human"
-    if s in ("vehicle", "car", "truck", "atv", "utv", "tractor"):
+    if s in ("vehicle", "car", "truck", "atv", "utv", "tractor", "suv", "van"):
         return "vehicle"
     if s in ("animal", "wildlife", "mammal", "bird", "reptile", "amphibian"):
         return "animal"
-    if s in JUNK_VALUES:
-        return "blank"
     return s
 
 
-def normalize_species(raw: Optional[str]) -> str:
+def normalize_species_label_to_broad(raw: Optional[str]) -> str:
     """
-    Returns canonical name safe for dashboard charts.
-    Unknown/vague/junk -> "Other"
+    Normalize ONE raw label into a BROAD category.
+    Returns 'Other' if unknown / junk / dog/cat.
     """
     s = _clean_basic(str(raw or ""))
 
-    if not s or s in JUNK_VALUES:
+    if _is_bad_label(s):
         return "Other"
 
-    # If the model is outputting broad categories, don't chart them
-    if s in BROAD_CATEGORIES:
+    # drop dogs/cats (you requested “disregard domestic dog columns”)
+    if s in DOG_ALIASES:
+        return "Other"
+    if s in CAT_ALIASES:
         return "Other"
 
-    # If the label is explicitly banned for being too vague
-    if s in BANNED_LABELS:
-        return "Other"
+    # direct map
+    if s in BROAD_MAP:
+        return BROAD_MAP[s]
 
-    # Canonical mapping
-    if s in CANONICAL_SPECIES:
-        return CANONICAL_SPECIES[s]
-
-    # Heuristic consolidations (covers tons of “almost” matches)
-    # e.g., "white tailed deer buck" -> "White-tailed Deer"
-    if "white" in s and "tail" in s and "deer" in s:
-        return "White-tailed Deer"
-    if "deer" == s or s.endswith(" deer"):
-        # If we haven't mapped it, it’s probably an exotic — keep title-cased
-        return _title_case(s)
-
-    if "hog" in s or "boar" in s or "pig" in s:
+    # heuristic containment (catches “white tailed deer buck”, etc.)
+    if "vehicle" in s or any(w in s for w in ["truck", "pickup", "atv", "utv", "side by side", "tractor", "suv", "van"]):
+        return "Vehicle"
+    if any(w in s for w in ["human", "person", "man", "woman"]):
+        return "Human"
+    if ("white" in s and "tail" in s and "deer" in s) or "whitetail" in s:
+        return "Deer"
+    if "deer" in s:
+        return "Deer"
+    if any(w in s for w in ["hog", "boar", "pig"]):
         return "Feral Hog"
-
     if "coyote" in s:
         return "Coyote"
-
     if "bobcat" in s:
         return "Bobcat"
-
+    if "lion" in s or "cougar" in s or "puma" in s:
+        return "Mountain Lion"
     if "raccoon" in s:
         return "Raccoon"
-
     if "opossum" in s or "possum" in s:
         return "Opossum"
-
+    if "skunk" in s:
+        return "Skunk"
     if "armadillo" in s:
         return "Armadillo"
-
-    if "vulture" in s:
-        return "Vulture"
-
-    if "raven" in s:
-        return "Raven"
-    if "crow" in s:
-        return "Crow"
-
-    if "hawk" in s:
-        return "Hawk"
-
-    if "owl" in s:
-        return "Owl"
-
-    if "turkey" in s and "wild" in s:
-        return "Wild Turkey"
-    if s == "turkey":
-        return "Wild Turkey"
-
-    if "dove" in s:
-        return "Dove"
-
-    if "snake" in s:
-        # if it looks like a rattlesnake mention
-        if "diamond" in s or "rattle" in s:
-            return "Rattlesnake"
+    if "rabbit" in s or "cottontail" in s or "jackrabbit" in s:
+        return "Rabbit"
+    if "squirrel" in s:
+        return "Squirrel"
+    if any(w in s for w in ["hawk", "owl", "raven", "crow", "vulture", "turkey", "dove", "quail", "woodpecker", "bird"]):
+        return "Bird"
+    if "snake" in s or "rattle" in s or "diamondback" in s or "cottonmouth" in s:
         return "Snake"
+    if "turtle" in s:
+        return "Turtle"
+    if "lizard" in s or "gecko" in s or "anole" in s:
+        return "Lizard"
+    if "frog" in s:
+        return "Frog"
+    if "toad" in s:
+        return "Toad"
 
-    # Default: human-readable label, but keep it from exploding your charts
-    # If you want to be stricter, return "Other" here instead.
-    return _title_case(s)
+    return "Other"
+
+
+@dataclass(frozen=True)
+class Candidate:
+    label: str
+    conf: Optional[float]
+
+
+def choose_best_species_label(
+    *,
+    prediction_label: str,
+    prediction_conf: Optional[float],
+    topk: Iterable[Tuple[str, Optional[float]]],
+    strong_thresh: float = DEFAULT_STRONG_THRESH,
+) -> Tuple[str, Optional[float], str]:
+    """
+    Decide which label to trust BEFORE normalization.
+    Returns: (chosen_label, chosen_conf, source) where source is 'prediction' or 'top1'/'top2'/'top3' or 'none'
+    """
+    # 1) prediction if strong
+    if prediction_label:
+        pc = prediction_conf
+        if pc is not None and pc >= strong_thresh:
+            return prediction_label, pc, "prediction"
+
+    # 2) top-k if strong (first that clears threshold)
+    for i, (lbl, conf) in enumerate(topk, start=1):
+        if not lbl:
+            continue
+        c = conf
+        if c is not None and c >= strong_thresh:
+            return lbl, c, f"top{i}"
+
+    # 3) fallback: return best available by confidence even if below threshold
+    # (helps avoid empty if everything is low confidence)
+    best: Optional[Candidate] = None
+    best_src = "none"
+
+    if prediction_label and prediction_conf is not None:
+        best = Candidate(prediction_label, prediction_conf)
+        best_src = "prediction"
+
+    for i, (lbl, conf) in enumerate(topk, start=1):
+        if not lbl or conf is None:
+            continue
+        cand = Candidate(lbl, conf)
+        if best is None or (cand.conf or 0.0) > (best.conf or 0.0):
+            best = cand
+            best_src = f"top{i}"
+
+    if best is None:
+        return "", None, "none"
+    return best.label, best.conf, best_src
