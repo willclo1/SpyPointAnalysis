@@ -30,7 +30,9 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+          sudo apt-get install -y \
+            protobuf-compiler libprotobuf-dev pkg-config \
+            libavif-dev libaom-dev
 
       - name: Install Python dependencies (SpeciesNet-only)
         env:
