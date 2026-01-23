@@ -209,6 +209,8 @@ def normalize_species(raw: Optional[str]) -> Tuple[str, str]:
         return ("Hawk", "Birds")
     if "owl" in s:
         return ("Owl", "Birds")
+    if "raccoon" in s or "racoon" in s:
+        return ("Raccoon", "Small Mammals")
     if "snake" in s:
         if "rattle" in s or "diamond" in s:
             return ("Rattlesnake", "Reptiles")
