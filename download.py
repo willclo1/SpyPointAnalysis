@@ -5,9 +5,16 @@ import time
 import shutil
 import subprocess
 from pathlib import Path
+from datetime import datetime, date, timezone
 
 import requests
 import spypoint
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
 
 # Map SpyPoint camera IDs -> your friendly folder names
 CAMERA_NAME_MAP = {
@@ -16,18 +23,34 @@ CAMERA_NAME_MAP = {
     "64d2308abdc2af72ebb0e44b": "creek",
 }
 
-# --- Tuning (tight scope) ---
-POLL_LIMIT = 80          # how far back to look PER CAMERA
-MAX_NEW_PER_RUN = 250      # max NEW images we will download+upload per run (across cameras)
-SLEEP_SEC = 0.2           # gentle throttle between downloads
+# --- Tuning ---
+POLL_LIMIT = 250          # lookback window from SpyPoint API (we hard-filter by dates anyway)
+MAX_NEW_PER_RUN = 400     # cap across all cameras
+SLEEP_SEC = 0.2
 
-# Full resync mode:
-# - FULL_REDOWNLOAD=1 will download/upload everything in the POLL_LIMIT window,
-#   ignoring Drive-existence checks (but still dedupes within this run).
+# Full mode (within date window): re-download + re-upload even if already in Drive
 FULL_REDOWNLOAD = os.environ.get("FULL_REDOWNLOAD") == "1"
 
-# Local temp download staging (runner is ephemeral anyway)
+# Safety: if a photo has NO parseable date, skip it to prevent accidental backfill
+SKIP_IF_NO_DATE = True
+
+# Ranch timezone for date filtering
+LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ", "America/Chicago")
+LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME) if ZoneInfo else None
+
+# Optional date range
+# If neither is set => today-only
+START_DATE_ENV = os.environ.get("START_DATE", "").strip()
+END_DATE_ENV = os.environ.get("END_DATE", "").strip()
+
 OUT_DIR = Path("images")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+_WS_RE = re.compile(r"\s+")
+_DATE_IN_TEXT = re.compile(r"(20\d{2})[-_/]?([01]\d)[-_/]?([0-3]\d)")
 
 
 def safe_name(s: str) -> str:
@@ -35,11 +58,7 @@ def safe_name(s: str) -> str:
 
 
 def get_cam_id(cam) -> str:
-    return str(
-        getattr(cam, "id", None)
-        or getattr(cam, "camera_id", None)
-        or str(cam)
-    )
+    return str(getattr(cam, "id", None) or getattr(cam, "camera_id", None) or str(cam))
 
 
 def cam_folder_name(cam) -> str:
@@ -48,26 +67,133 @@ def cam_folder_name(cam) -> str:
 
 
 def spypoint_photo_filename(photo) -> str:
-    """
-    Derive a stable filename from the photo URL.
-    """
     url = photo.url()
     base = url.split("?")[0].split("/")[-1]
     return safe_name(base)
 
 
+def _now_local_date() -> date:
+    if LOCAL_TZ:
+        return datetime.now(LOCAL_TZ).date()
+    return datetime.now(timezone.utc).date()
+
+
+def _to_local_date(dt: datetime) -> date:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if LOCAL_TZ:
+        return dt.astimezone(LOCAL_TZ).date()
+    return dt.astimezone(timezone.utc).date()
+
+
+def _try_parse_datetime(val) -> datetime | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def photo_datetime(photo) -> datetime | None:
+    # 1) Common attribute names
+    for attr in ("datetime", "date", "created_at", "createdAt", "taken_at", "takenAt", "timestamp"):
+        if hasattr(photo, attr):
+            dt = _try_parse_datetime(getattr(photo, attr))
+            if dt:
+                return dt
+
+    # 2) dict-like
+    if isinstance(photo, dict):
+        for k in ("datetime", "date", "created_at", "createdAt", "taken_at", "takenAt", "timestamp"):
+            dt = _try_parse_datetime(photo.get(k))
+            if dt:
+                return dt
+
+    # 3) Parse date from URL / filename
+    try:
+        url = photo.url()
+    except Exception:
+        url = ""
+    text = f"{url} {spypoint_photo_filename(photo)}"
+    m = _DATE_IN_TEXT.search(text)
+    if m:
+        y, mo, d = m.groups()
+        try:
+            if LOCAL_TZ:
+                return datetime(int(y), int(mo), int(d), 0, 0, tzinfo=LOCAL_TZ)
+            return datetime(int(y), int(mo), int(d), 0, 0, tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    return None
+
+
+def parse_date_env(s: str) -> date | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        raise SystemExit(f"Invalid date '{s}'. Use YYYY-MM-DD (e.g. 2026-01-23).")
+
+
+def resolve_date_window() -> tuple[date, date]:
+    """
+    Safety-first policy:
+    - If neither START_DATE nor END_DATE set: window is [today, today]
+    - If START_DATE set but END_DATE not: window is [START_DATE, today]
+    - If END_DATE set but START_DATE not: window is [END_DATE, END_DATE]
+    - If both set: [START_DATE, END_DATE]
+    """
+    today = _now_local_date()
+    start = parse_date_env(START_DATE_ENV)
+    end = parse_date_env(END_DATE_ENV)
+
+    if start is None and end is None:
+        return today, today
+
+    if start is not None and end is None:
+        return start, today
+
+    if start is None and end is not None:
+        return end, end
+
+    # both set
+    assert start is not None and end is not None
+    if start > end:
+        raise SystemExit(f"START_DATE ({start}) cannot be after END_DATE ({end}).")
+    return start, end
+
+
+def in_date_window(photo) -> bool:
+    dt = photo_datetime(photo)
+    if not dt:
+        return False if SKIP_IF_NO_DATE else True
+    d = _to_local_date(dt)
+    return WINDOW_START <= d <= WINDOW_END
+
+
+# -----------------------------
+# rclone helpers
+# -----------------------------
 def run_rclone_json(args: list[str]) -> list[dict]:
-    """
-    Run `rclone ... --json` and return parsed JSON list.
-    """
-    p = subprocess.run(
-        args,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    p = subprocess.run(args, check=False, capture_output=True, text=True)
     if p.returncode != 0:
-        # Often means folder doesn't exist yet. Treat as empty.
         return []
     out = (p.stdout or "").strip()
     if not out:
@@ -79,23 +205,14 @@ def run_rclone_json(args: list[str]) -> list[dict]:
 
 
 def drive_existing_filenames(root_folder_id: str, cam_folder: str) -> set[str]:
-    """
-    List filenames that already exist in Drive under <root>/<cam_folder>.
-    Uses rclone lsjson for a fast directory listing.
-    """
-    # Ensure folder exists (safe to call even if it exists)
     subprocess.run(
         ["rclone", "mkdir", f"gdrive:{cam_folder}", "--drive-root-folder-id", root_folder_id],
         check=False,
     )
 
-    items = run_rclone_json([
-        "rclone",
-        "lsjson",
-        f"gdrive:{cam_folder}",
-        "--drive-root-folder-id",
-        root_folder_id,
-    ])
+    items = run_rclone_json(
+        ["rclone", "lsjson", f"gdrive:{cam_folder}", "--drive-root-folder-id", root_folder_id]
+    )
 
     existing = set()
     for it in items:
@@ -106,6 +223,9 @@ def drive_existing_filenames(root_folder_id: str, cam_folder: str) -> set[str]:
     return existing
 
 
+# -----------------------------
+# IO
+# -----------------------------
 def download(url: str, out_path: Path) -> None:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
@@ -113,33 +233,24 @@ def download(url: str, out_path: Path) -> None:
 
 
 def upload_to_drive(local_path: Path, root_folder_id: str, cam_folder: str, filename: str) -> None:
-    """
-    Upload to: Drive root/<cam_folder>/<filename>
-    """
     dest = f"gdrive:{cam_folder}/{filename}"
     subprocess.run(
-        [
-            "rclone",
-            "copyto",
-            str(local_path),
-            dest,
-            "--drive-root-folder-id",
-            root_folder_id,
-            "-v",
-        ],
+        ["rclone", "copyto", str(local_path), dest, "--drive-root-folder-id", root_folder_id, "-v"],
         check=True,
     )
 
 
 def prepare_local_dirs():
-    """
-    On a GitHub runner, images/ might not exist.
-    If FULL_REDOWNLOAD is enabled, wipe images/ so we start clean locally.
-    """
     if FULL_REDOWNLOAD and OUT_DIR.exists():
         print("[MODE] FULL_REDOWNLOAD=1 -> wiping local images/ staging dir")
         shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+WINDOW_START, WINDOW_END = resolve_date_window()
 
 
 def main():
@@ -148,23 +259,29 @@ def main():
     if not email or not password:
         raise SystemExit("Set SPYPOINT_EMAIL and SPYPOINT_PASSWORD env vars.")
 
-    # This must be the Drive folder ID you already use as your "root"
     root_folder_id = os.environ.get("GDRIVE_FOLDER_ID")
     if not root_folder_id:
         raise SystemExit("Set GDRIVE_FOLDER_ID env var (Drive folder that holds your camera folders).")
 
     prepare_local_dirs()
 
+    print(f"[TZ] {LOCAL_TZ_NAME}")
+    print(f"[WINDOW] {WINDOW_START} -> {WINDOW_END}")
+    if START_DATE_ENV or END_DATE_ENV:
+        print("[MODE] Date range requested via START_DATE/END_DATE")
+    else:
+        print("[MODE] Default: today-only (no START_DATE/END_DATE set)")
+
+    if FULL_REDOWNLOAD:
+        print("[MODE] FULL_REDOWNLOAD=1 (re-upload within date window, ignore Drive existence checks)")
+
     c = spypoint.Client(email, password)
     cams = c.cameras()
 
     print("Camera count:", len(cams))
     for cam in cams:
-        cam_id = get_cam_id(cam)
-        print("cam:", cam_folder_name(cam), "id:", cam_id)
+        print("cam:", cam_folder_name(cam), "id:", get_cam_id(cam))
 
-    # Build a Drive index of existing filenames per camera folder
-    # Skip this entirely in FULL_REDOWNLOAD mode (tighter + faster).
     existing_by_cam: dict[str, set[str]] = {}
     if not FULL_REDOWNLOAD:
         for cam in cams:
@@ -172,38 +289,44 @@ def main():
             existing_by_cam[folder] = drive_existing_filenames(root_folder_id, folder)
             print(f"[Drive] {folder}: {len(existing_by_cam[folder])} files indexed")
     else:
-        print("[MODE] FULL_REDOWNLOAD=1 -> not indexing Drive. Will re-upload within window.")
         for cam in cams:
             folder = safe_name(cam_folder_name(cam))
-            # keep an empty set so the rest of the code can reference it
             existing_by_cam[folder] = set()
 
     new_uploaded = 0
     inspected = 0
     skipped_existing = 0
+    skipped_outside_window = 0
+    skipped_no_date = 0
 
     for cam in cams:
         folder = safe_name(cam_folder_name(cam))
-
-        # Pull recent photos for this camera
         photos = c.photos([cam], limit=POLL_LIMIT)
 
         for p in photos:
             inspected += 1
+
+            dt = photo_datetime(p)
+            if not dt and SKIP_IF_NO_DATE:
+                skipped_no_date += 1
+                continue
+
+            if not in_date_window(p):
+                skipped_outside_window += 1
+                continue
+
             url = p.url()
             filename = spypoint_photo_filename(p)
 
-            # Normal mode: skip if already in Drive (does NOT count against MAX_NEW_PER_RUN)
             if not FULL_REDOWNLOAD and filename in existing_by_cam[folder]:
                 skipped_existing += 1
                 continue
 
-            # Local staging path
             cam_dir = OUT_DIR / folder
             cam_dir.mkdir(parents=True, exist_ok=True)
             out_path = cam_dir / filename
 
-            # Dedupe within-run downloads (even in FULL_REDOWNLOAD)
+            # within-run dedupe
             if out_path.exists():
                 continue
 
@@ -212,25 +335,32 @@ def main():
                 upload_to_drive(out_path, root_folder_id, folder, filename)
             except Exception as e:
                 print(f"[ERROR] {folder}/{filename}: {e}")
-                # keep going; transient errors happen
                 continue
 
-            # Mark as existing immediately so we don't re-upload within the same run
             existing_by_cam[folder].add(filename)
-
             new_uploaded += 1
+
             mode_tag = "REUP" if FULL_REDOWNLOAD else "NEW"
-            print(f"[{mode_tag}] Uploaded: {folder}/{filename} (uploaded={new_uploaded})")
+            dt_str = dt.isoformat() if dt else "unknown-dt"
+            print(f"[{mode_tag}] {folder}/{filename}  dt={dt_str}  uploaded={new_uploaded}")
 
             if new_uploaded >= MAX_NEW_PER_RUN:
                 print(f"Reached MAX_NEW_PER_RUN={MAX_NEW_PER_RUN}. Stopping.")
-                print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  Uploaded={new_uploaded}")
-                return
+                break
 
             time.sleep(SLEEP_SEC)
 
+        if new_uploaded >= MAX_NEW_PER_RUN:
+            break
+
     print("Done.")
-    print(f"Inspected={inspected}  SkippedExisting={skipped_existing}  Uploaded={new_uploaded}")
+    print(
+        f"Inspected={inspected}  "
+        f"SkippedOutsideWindow={skipped_outside_window}  "
+        f"SkippedNoDate={skipped_no_date}  "
+        f"SkippedExisting={skipped_existing}  "
+        f"Uploaded={new_uploaded}"
+    )
 
 
 if __name__ == "__main__":
