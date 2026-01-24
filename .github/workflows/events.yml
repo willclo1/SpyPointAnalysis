@@ -1,0 +1,55 @@
+name: Build events.json (Netflix view)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 18 * * *"  # daily 12:15 PM Central (after your main job)
+
+jobs:
+  build-json:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: Download events.csv from Drive
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone copyto "gdrive:events.csv" ./events.csv --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+
+      - name: Build docs/events.json
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          mkdir -p docs
+          python build_events_json.py
+
+      # Option A: Upload JSON back to the same Drive folder (recommended)
+      - name: Upload events.json to Drive
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone copyto ./docs/events.json "gdrive:events.json" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
