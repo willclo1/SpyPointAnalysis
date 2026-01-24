@@ -1,0 +1,84 @@
+name: One-time rebuild feeder -> events.csv
+
+on:
+  workflow_dispatch:
+
+jobs:
+  feeder_rebuild:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-feeder-rebuild-${{ hashFiles('**/*.txt', '**/*.toml', '**/*.py', '**/*.yml', '**/*.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-feeder-rebuild-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+
+      - name: Install Python dependencies
+        env:
+          PIP_ONLY_BINARY: "onnx,blake3"
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install requests google-cloud-vision
+          pip install opencv-python-headless pillow numpy pandas
+          pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
+          pip install speciesnet
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: Write Google Vision credentials
+        run: |
+          echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
+
+      - name: Download existing events.csv from Drive (if exists)
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
+
+      - name: Download feeder images from Drive (one-time repair)
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rm -rf images
+          mkdir -p images/feeder
+          rclone copy "gdrive:feeder" "images/feeder" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+
+      - name: Run SpeciesNet + OCR -> events.csv (append feeder only)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+          SPECIESNET_COUNTRY: "USA"
+          # SPECIESNET_ADMIN1: "TX"
+        run: |
+          python run_events_append.py
+
+      - name: Upload updated events files back to Drive
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          rclone copyto events.csv "gdrive:events.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+          rclone copyto events.tsv "gdrive:events.tsv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
