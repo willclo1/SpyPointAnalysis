@@ -8,6 +8,7 @@ It will do basic cleaning work on the data and place the data into a csv and the
 ## Stack
 
 DB: Google Drive(I know not great)
+
 Tools: Google Vision OCR, Python, SpeciesNet
 
 ## SpeciesNetLink
