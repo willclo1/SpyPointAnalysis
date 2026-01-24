@@ -11,9 +11,9 @@ import spypoint
 
 # Map SpyPoint camera IDs -> your friendly folder names
 CAMERA_NAME_MAP = {
-    "64d2308abdc2af72ebb0e44b": "gate",
+    "696e3766f762a13e8e9526ab": "gate",
     "696d50430049dd29d16b3c5f": "feeder",
-    "696e3766f762a13e8e9526ab": "ravine",
+    "64d2308abdc2af72ebb0e44b": "creek",
 }
 
 # --- Tuning (tight scope) ---
