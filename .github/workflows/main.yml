@@ -42,6 +42,7 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
 
           # Core app deps
+          pip install astral
           pip install pyspypoint requests google-cloud-vision
           pip install opencv-python-headless pillow numpy pandas
 
@@ -79,6 +80,10 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
+
+      - name: Backfill moon phase for all rows
+        run: |
+          python add_moon_to_events.py
 
       - name: Run SpeciesNet + OCR -> events.csv (append)
         env:
