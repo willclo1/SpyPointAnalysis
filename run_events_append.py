@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
-from species_normalization import normalize_species, normalize_event_type
+from species_normalization import normalize_species
 from vision_ocr import ocr_spypoint_stamp_vision
 from moon import moon_info  # <-- add this file (moon.py) as I sent earlier
 
@@ -296,7 +296,7 @@ def main():
         vehicle_conf = max_conf_for_category(dets, CAT_VEHICLE)
 
         event_type = pick_event_type(animal_conf, human_conf, vehicle_conf)
-        event_type = normalize_event_type(event_type)
+        event_type = event_type
 
         # Top-3 (raw labels, readable)
         top3 = extract_top3(pred)
