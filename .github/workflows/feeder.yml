@@ -1,12 +1,10 @@
-name: Pull SPYPOINT photos to Google Drive
+name: One-time rebuild feeder -> events.csv
 
 on:
-  schedule:
-    - cron: "0 18 * * *"   # daily at 12:00 PM Central (CST)
   workflow_dispatch:
 
 jobs:
-  pull:
+  feeder_rebuild:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,34 +20,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
+          key: ${{ runner.os }}-pip-feeder-rebuild-${{ hashFiles('**/*.txt', '**/*.toml', '**/*.py', '**/*.yml', '**/*.yaml') }}
           restore-keys: |
-            ${{ runner.os }}-pip-py311-
+            ${{ runner.os }}-pip-feeder-rebuild-
 
-      # System deps (keep)
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            protobuf-compiler libprotobuf-dev pkg-config \
-            libavif-dev libaom-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
 
-      - name: Install Python dependencies (SpeciesNet-only)
+      - name: Install Python dependencies
         env:
-          # Avoid any surprise source builds for these
           PIP_ONLY_BINARY: "onnx,blake3"
         run: |
           python -m pip install --upgrade pip setuptools wheel
-
-          # Core app deps
-          pip install astral
-          pip install pyspypoint requests google-cloud-vision
+          pip install requests google-cloud-vision
           pip install opencv-python-headless pillow numpy pandas
-
-          # Force wheels for common problem deps (prevents Rust/toolchain builds)
           pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
-
-          # SpeciesNet (includes detector outputs for animal/human/vehicle)
           pip install speciesnet
 
       - name: Install rclone
@@ -62,15 +49,7 @@ jobs:
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
-          
-      - name: Download new SPYPOINT photos
-        env:
-          SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
-          SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          python download.py
-        
+
       - name: Write Google Vision credentials
         run: |
           echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
@@ -81,25 +60,25 @@ jobs:
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-      - name: Backfill moon phase for all rows
+      - name: Download feeder images from Drive (one-time repair)
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          python add_moon_to_events.py
+          rm -rf images
+          mkdir -p images/feeder
+          rclone copy "gdrive:feeder" "images/feeder" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
 
-      - name: Run SpeciesNet + OCR -> events.csv (append)
+      - name: Run SpeciesNet + OCR -> events.csv (append feeder only)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
-          # Optional: if you want geofencing to improve accuracy:
           SPECIESNET_COUNTRY: "USA"
           # SPECIESNET_ADMIN1: "TX"
         run: |
           python run_events_append.py
-          
-      - name: Upload images + events files to Google Drive folder
+
+      - name: Upload updated events files back to Drive
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          rclone copy images gdrive: --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing -v
-
-          # upload both (tsv opens cleanly in Sheets)
           rclone copyto events.csv "gdrive:events.csv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
-          rclone copyto events.tsv "gdrive:events.tsv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v
+          rclone copyto events.tsv "gdrive:events.tsv" --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
