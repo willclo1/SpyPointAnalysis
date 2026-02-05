@@ -81,10 +81,6 @@ jobs:
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-      - name: Backfill moon phase for all rows
-        run: |
-          python add_moon_to_events.py
-
       - name: Run SpeciesNet + OCR -> events.csv (append)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
