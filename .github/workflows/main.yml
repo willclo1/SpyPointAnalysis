@@ -51,6 +51,7 @@ jobs:
 
           # SpeciesNet (includes detector outputs for animal/human/vehicle)
           pip install speciesnet
+          pip install --upgrade pip setuptools wheel
 
       - name: Install rclone
         run: |
