@@ -117,7 +117,7 @@ def write_table(path: Path, rows: List[Dict[str, str]], delimiter: str):
 
 
 def run_speciesnet(images_dir: Path, out_json: Path):
-        cmd = [
+    cmd = [
         sys.executable, "-m", "speciesnet.scripts.run_model",
         "--folders", str(images_dir),
         "--predictions_json", str(out_json),
