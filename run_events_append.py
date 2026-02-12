@@ -18,6 +18,7 @@ OUT_TSV = Path("events.tsv")
 SPECIESNET_JSON = Path("speciesnet-results.json")
 
 UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING") == "1"
+FULL_REBUILD = os.environ.get("FULL_REBUILD") == "1"
 
 # thresholds (detections come from SpeciesNet output)
 ANIMAL_THRESH = 0.20
@@ -275,6 +276,12 @@ def main():
             by_relpath[Path(fp).name] = p
 
     existing = load_existing(OUT_CSV)
+    
+    # On full rebuild, start fresh
+    if FULL_REBUILD:
+        print("FULL_REBUILD enabled - processing all images from scratch")
+        existing = {}
+    
     added, updated = 0, 0
 
     for img_path in sorted(IMAGES_DIR.rglob("*.jpg")):
@@ -282,7 +289,8 @@ def main():
         camera = img_path.parent.name if img_path.parent != IMAGES_DIR else "unknown"
         key = row_key(camera, fn)
 
-        if key in existing and not UPDATE_EXISTING:
+        # Skip if already processed (unless UPDATE_EXISTING or FULL_REBUILD)
+        if key in existing and not UPDATE_EXISTING and not FULL_REBUILD:
             continue
 
         stamp = ocr_spypoint_stamp_vision(str(img_path))
