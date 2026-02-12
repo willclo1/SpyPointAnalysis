@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 18 * * *"   # daily at 12:00 PM Central (CST)
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Rebuild events.csv from scratch?"
+        required: false
+        default: "false"
 
 jobs:
   pull:
@@ -18,14 +23,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      # - name: Cache pip
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: ~/.cache/pip
-      #     key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
-      #     restore-keys: |
-      #       ${{ runner.os }}-pip-py311-
-    
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-py311-
+
       # System deps (keep)
       - name: Install system deps
         run: |
@@ -36,25 +41,22 @@ jobs:
 
       - name: Install Python dependencies (SpeciesNet-only)
         env:
+          # Avoid any surprise source builds for these
           PIP_ONLY_BINARY: "onnx,blake3"
         run: |
-          # IMPORTANT: pkg_resources comes from setuptools.
-          # Newer setuptools builds can remove pkg_resources, which breaks yolov5/speciesnet.
-          python -m pip install --upgrade "pip<26" "setuptools==80.9.0" wheel
-          python -c "import pkg_resources; print('pkg_resources OK')"
+          python -m pip install --upgrade pip setuptools wheel
 
           # Core app deps
-          python -m pip install astral pyspypoint requests google-cloud-vision
-          python -m pip install opencv-python-headless pillow numpy pandas
+          pip install astral
+          pip install pyspypoint requests google-cloud-vision
+          pip install opencv-python-headless pillow numpy pandas
 
           # Force wheels for common problem deps (prevents Rust/toolchain builds)
-          python -m pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
+          pip install --only-binary=:all: "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
 
-          # SpeciesNet
-          python -m pip install speciesnet
-
-          # Verify again AFTER speciesnet install
-          python -c "import pkg_resources; import speciesnet; print('speciesnet import OK')"
+          # SpeciesNet (includes detector outputs for animal/human/vehicle)
+          pip install speciesnet
+          pip install --upgrade pip setuptools wheel
 
       - name: Install rclone
         run: |
@@ -74,12 +76,13 @@ jobs:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           python download.py
-        
+          
       - name: Write Google Vision credentials
         run: |
           echo '${{ secrets.GCP_VISION_KEY_JSON }}' > gcp-key.json
 
       - name: Download existing events.csv from Drive (if exists)
+        if: ${{ github.event.inputs.full_rebuild != 'true' }}
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
@@ -90,6 +93,7 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
           # Optional: if you want geofencing to improve accuracy:
           SPECIESNET_COUNTRY: "USA"
+          FULL_REBUILD: ${{ github.event.inputs.full_rebuild }}
           # SPECIESNET_ADMIN1: "TX"
         run: |
           python run_events_append.py
