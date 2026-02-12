@@ -18,13 +18,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-py311-
+      # - name: Cache pip
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: ~/.cache/pip
+      #     key: ${{ runner.os }}-pip-py311-${{ hashFiles('**/*.yml', '**/*.yaml', '**/*.py') }}
+      #     restore-keys: |
+      #       ${{ runner.os }}-pip-py311-
     
       # System deps (keep)
       - name: Install system deps
@@ -82,10 +82,6 @@ jobs:
         run: |
           rclone copy "gdrive:events.csv" . --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-      - name: Ensure setuptools (pkg_resources) is present
-        run: |
-          python -m pip install --upgrade setuptools
-          python -c "import pkg_resources; print('pkg_resources ok')"
       - name: Run SpeciesNet + OCR -> events.csv (append)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
