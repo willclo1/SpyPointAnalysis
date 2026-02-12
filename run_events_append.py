@@ -2,6 +2,7 @@
 import csv
 import json
 import os
+import sys
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -116,8 +117,8 @@ def write_table(path: Path, rows: List[Dict[str, str]], delimiter: str):
 
 
 def run_speciesnet(images_dir: Path, out_json: Path):
-    cmd = [
-        "python", "-m", "speciesnet.scripts.run_model",
+        cmd = [
+        sys.executable, "-m", "speciesnet.scripts.run_model",
         "--folders", str(images_dir),
         "--predictions_json", str(out_json),
     ]
