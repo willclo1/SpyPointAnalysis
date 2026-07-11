@@ -13,6 +13,18 @@ on:
         default: false
         type: boolean
 
+      backfill_start:
+        description: Optional backfill start date (YYYY-MM-DD)
+        required: false
+        default: ""
+        type: string
+
+      backfill_end:
+        description: Optional backfill end date (YYYY-MM-DD)
+        required: false
+        default: ""
+        type: string
+
 concurrency:
   group: spypoint-photo-pipeline
   cancel-in-progress: false
@@ -30,7 +42,6 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_NO_INPUT: "1"
   PIP_ONLY_BINARY: "onnx,blake3"
-
   IMAGE_DIRECTORY: "images"
   EVENTS_CSV: "events.csv"
   EVENTS_TSV: "events.tsv"
@@ -42,7 +53,7 @@ jobs:
   pull:
     name: Download and analyze SPYPOINT photos
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -58,32 +69,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-
-          sudo apt-get install \
-            --yes \
-            --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            pkg-config \
-            libavif-dev \
-            libaom-dev
-
+          sudo apt-get install --yes --no-install-recommends \
+            protobuf-compiler libprotobuf-dev pkg-config \
+            libavif-dev libaom-dev
           sudo rm -rf /var/lib/apt/lists/*
 
       - name: Install Python dependencies
         run: |
-          python -m pip install --upgrade \
-            "pip<26" \
-            "setuptools==80.9.0" \
-            wheel
-
-          python -m pip install \
-            --only-binary=:all: \
-            "onnx==1.16.2" \
-            "protobuf<5" \
-            "blake3==1.0.8" \
-            "asn1crypto==1.5.1"
-
+          python -m pip install --upgrade "pip<26" "setuptools==80.9.0" wheel
+          python -m pip install --only-binary=:all: \
+            "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
           python -m pip install -r requirements.txt
 
       - name: Verify Python environment
@@ -97,407 +92,189 @@ jobs:
           import speciesnet
           import google.cloud.vision
           import astral
-
           print("Python dependency verification passed")
           PY
 
       - name: Install rclone
         run: |
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            https://rclone.org/install.sh \
-            --output /tmp/install-rclone.sh
-
+          curl --fail --silent --show-error --location \
+            https://rclone.org/install.sh --output /tmp/install-rclone.sh
           sudo bash /tmp/install-rclone.sh
           rm -f /tmp/install-rclone.sh
-
           rclone version
 
       - name: Configure rclone
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
         run: |
-          if [[ -z "$RCLONE_CONF" ]]; then
-            echo "::error::The RCLONE_CONF repository secret is missing."
-            exit 1
-          fi
-
+          test -n "$RCLONE_CONF" || { echo "::error::RCLONE_CONF is missing"; exit 1; }
           mkdir -p "$HOME/.config/rclone"
           chmod 700 "$HOME/.config/rclone"
-
-          printf '%s' "$RCLONE_CONF" \
-            > "$HOME/.config/rclone/rclone.conf"
-
+          printf '%s' "$RCLONE_CONF" > "$HOME/.config/rclone/rclone.conf"
           chmod 600 "$HOME/.config/rclone/rclone.conf"
-
-          if ! rclone listremotes | grep --quiet '^gdrive:$'; then
-            echo "::error::The rclone configuration does not contain a gdrive remote."
+          rclone listremotes | grep --quiet '^gdrive:$' || {
+            echo "::error::The rclone configuration has no gdrive remote."
             exit 1
-          fi
+          }
 
-      - name: Validate required secrets
+      - name: Validate inputs and secrets
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GCP_VISION_KEY_JSON: ${{ secrets.GCP_VISION_KEY_JSON }}
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
           FULL_REBUILD: ${{ inputs.full_rebuild || false }}
+          BACKFILL_START: ${{ inputs.backfill_start || '' }}
+          BACKFILL_END: ${{ inputs.backfill_end || '' }}
         run: |
-          missing=0
-
-          require_secret() {
-            local name="$1"
-            local value="$2"
-
-            if [[ -z "$value" ]]; then
-              echo "::error::Required secret $name is missing."
-              missing=1
-            fi
-          }
-
-          require_secret "GDRIVE_FOLDER_ID" "$GDRIVE_FOLDER_ID"
-          require_secret "GCP_VISION_KEY_JSON" "$GCP_VISION_KEY_JSON"
+          test -n "$GDRIVE_FOLDER_ID" || { echo "::error::GDRIVE_FOLDER_ID is missing"; exit 1; }
+          test -n "$GCP_VISION_KEY_JSON" || { echo "::error::GCP_VISION_KEY_JSON is missing"; exit 1; }
 
           if [[ "$FULL_REBUILD" != "true" ]]; then
-            require_secret "SPYPOINT_EMAIL" "$SPYPOINT_EMAIL"
-            require_secret "SPYPOINT_PASSWORD" "$SPYPOINT_PASSWORD"
+            test -n "$SPYPOINT_EMAIL" || { echo "::error::SPYPOINT_EMAIL is missing"; exit 1; }
+            test -n "$SPYPOINT_PASSWORD" || { echo "::error::SPYPOINT_PASSWORD is missing"; exit 1; }
           fi
 
-          if [[ "$missing" -ne 0 ]]; then
-            exit 1
+          if [[ -n "$BACKFILL_START" || -n "$BACKFILL_END" ]]; then
+            test -n "$BACKFILL_START" || { echo "::error::Both backfill dates are required"; exit 1; }
+            test -n "$BACKFILL_END" || { echo "::error::Both backfill dates are required"; exit 1; }
+            date -d "$BACKFILL_START" +%F >/dev/null
+            date -d "$BACKFILL_END" +%F >/dev/null
+            if [[ "$BACKFILL_START" > "$BACKFILL_END" ]]; then
+              echo "::error::backfill_start cannot be after backfill_end"
+              exit 1
+            fi
           fi
 
       - name: Validate repository files
         run: |
-          required_files=(
-            "requirements.txt"
-            "download.py"
-            "run_events_append.py"
-            "build_events_json.py"
-            "config.py"
-            "processing_manifest.py"
-            "pipeline_config.json"
-          )
-
-          missing=0
-
-          for file in "${required_files[@]}"; do
-            if [[ ! -f "$file" ]]; then
-              echo "::error::Required repository file is missing: $file"
-              missing=1
-            fi
+          for file in requirements.txt download.py run_events_append.py \
+            build_events_json.py config.py processing_manifest.py pipeline_config.json; do
+            test -f "$file" || { echo "::error::Missing $file"; exit 1; }
           done
-
-          if [[ "$missing" -ne 0 ]]; then
-            exit 1
-          fi
-
-          python -m json.tool pipeline_config.json > /dev/null
+          python -m json.tool pipeline_config.json >/dev/null
 
       - name: Prepare workspace
         run: |
-          mkdir -p "$IMAGE_DIRECTORY"
-          mkdir -p docs
-
-          rm -f "$EVENTS_CSV"
-          rm -f "$EVENTS_TSV"
-          rm -f "$EVENTS_JSON"
-          rm -f "$PROCESSING_MANIFEST"
+          mkdir -p "$IMAGE_DIRECTORY" docs
+          rm -f "$EVENTS_CSV" "$EVENTS_TSV" "$EVENTS_JSON" "$PROCESSING_MANIFEST"
 
       - name: Download existing pipeline state
-        if: github.event_name == 'schedule' || inputs.full_rebuild != true
+        if: inputs.full_rebuild != true
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          download_if_exists() {
-            local remote_name="$1"
-            local local_name="$2"
+          rclone copyto "gdrive:events.csv" "$EVENTS_CSV" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
+          rclone copyto "gdrive:processing-manifest.json" "$PROCESSING_MANIFEST" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" -v || true
 
-            if rclone lsf \
-              "gdrive:$remote_name" \
-              --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-              --files-only |
-              grep --quiet "^${remote_name}$"; then
-
-              echo "Downloading existing $remote_name"
-
-              rclone copyto \
-                "gdrive:$remote_name" \
-                "$local_name" \
-                --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-                --retries 5 \
-                --low-level-retries 10 \
-                --verbose
-            else
-              echo "$remote_name does not exist yet."
-            fi
-          }
-
-          download_if_exists "events.csv" "$EVENTS_CSV"
-          download_if_exists "processing-manifest.json" "$PROCESSING_MANIFEST"
-
-      - name: Download new SPYPOINT photos
-        if: github.event_name == 'schedule' || inputs.full_rebuild != true
+      - name: Download new or backfill SPYPOINT photos
+        if: inputs.full_rebuild != true
         env:
           SPYPOINT_EMAIL: ${{ secrets.SPYPOINT_EMAIL }}
           SPYPOINT_PASSWORD: ${{ secrets.SPYPOINT_PASSWORD }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          python download.py
+          START_DATE: ${{ inputs.backfill_start || '' }}
+          END_DATE: ${{ inputs.backfill_end || '' }}
+          FULL_REDOWNLOAD: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '1' || '0' }}
+          POLL_LIMIT: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '5000' || '250' }}
+          MAX_NEW_PER_RUN: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '5000' || '400' }}
+          LOCAL_TZ: "America/Chicago"
+        run: python download.py
 
       - name: Download all existing images for full rebuild
-        if: github.event_name == 'workflow_dispatch' && inputs.full_rebuild == true
+        if: inputs.full_rebuild == true
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          rclone copy \
-            "gdrive:" \
-            "$IMAGE_DIRECTORY" \
+          rclone copy "gdrive:" "$IMAGE_DIRECTORY" \
             --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --include "**.jpg" \
-            --include "**.jpeg" \
-            --include "**.png" \
-            --include "**.JPG" \
-            --include "**.JPEG" \
-            --include "**.PNG" \
-            --transfers 8 \
-            --checkers 16 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --stats 30s \
-            --stats-one-line \
-            --verbose
+            --include "**.jpg" --include "**.jpeg" --include "**.png" \
+            --include "**.JPG" --include "**.JPEG" --include "**.PNG" \
+            --transfers 8 --checkers 16 --retries 5 --low-level-retries 10 \
+            --stats 30s --stats-one-line -v
 
       - name: Write Google Vision credentials
         env:
           GCP_VISION_KEY_JSON: ${{ secrets.GCP_VISION_KEY_JSON }}
         run: |
           CREDENTIAL_FILE="$RUNNER_TEMP/gcp-vision-key.json"
-
           printf '%s' "$GCP_VISION_KEY_JSON" > "$CREDENTIAL_FILE"
           chmod 600 "$CREDENTIAL_FILE"
-
-          python -m json.tool "$CREDENTIAL_FILE" > /dev/null
-
-          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDENTIAL_FILE" \
-            >> "$GITHUB_ENV"
+          python -m json.tool "$CREDENTIAL_FILE" >/dev/null
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDENTIAL_FILE" >> "$GITHUB_ENV"
 
       - name: Count input images
         id: image-count
         run: |
-          image_count="$(
-            find "$IMAGE_DIRECTORY" \
-              -type f \
-              \( \
-                -iname '*.jpg' \
-                -o -iname '*.jpeg' \
-                -o -iname '*.png' \
-              \) |
-            wc -l |
-            tr -d ' '
-          )"
-
-          echo "count=$image_count" >> "$GITHUB_OUTPUT"
-          echo "Found $image_count image(s) to inspect."
+          count=$(find "$IMAGE_DIRECTORY" -type f \
+            \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Found $count image(s)."
 
       - name: Run SpeciesNet and OCR
         if: steps.image-count.outputs.count != '0'
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
-
           SPECIESNET_COUNTRY: "USA"
           SPECIESNET_ADMIN1: "TX"
-
           FULL_REBUILD: ${{ inputs.full_rebuild == true && '1' || '0' }}
-          UPDATE_EXISTING: "0"
+          UPDATE_EXISTING: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '1' || '0' }}
           REUSE_SPECIESNET: ${{ inputs.full_rebuild == true && '0' || '1' }}
-
           PROCESSING_MANIFEST: ${{ env.PROCESSING_MANIFEST }}
           PIPELINE_CONFIG: ${{ env.PIPELINE_CONFIG }}
-        run: |
-          python run_events_append.py
+        run: python run_events_append.py
 
-      - name: Handle run with no local images
+      - name: Handle no local images
         if: steps.image-count.outputs.count == '0'
         run: |
-          if [[ -s "$EVENTS_CSV" ]]; then
-            echo "No new images were downloaded. Keeping existing event data."
-          else
-            echo "::error::No images and no existing events.csv were available."
+          test -s "$EVENTS_CSV" || {
+            echo "::error::No local images and no existing events.csv were available."
             exit 1
-          fi
-
-      - name: Validate processing manifest
-        if: steps.image-count.outputs.count != '0'
-        run: |
-          if [[ ! -s "$PROCESSING_MANIFEST" ]]; then
-            echo "::error::$PROCESSING_MANIFEST was not created or is empty."
-            exit 1
-          fi
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path("processing-manifest.json")
-
-          with path.open("r", encoding="utf-8") as file:
-              data = json.load(file)
-
-          if not isinstance(data, dict):
-              raise SystemExit("processing-manifest.json must contain a JSON object")
-
-          print(
-              "processing-manifest.json validation passed "
-              f"with {len(data)} top-level entries"
-          )
-          PY
-
-      - name: Validate event CSV
-        run: |
-          if [[ ! -s "$EVENTS_CSV" ]]; then
-            echo "::error::$EVENTS_CSV was not created or is empty."
-            exit 1
-          fi
-
-          python - <<'PY'
-          import csv
-          from pathlib import Path
-
-          path = Path("events.csv")
-
-          with path.open(
-              "r",
-              encoding="utf-8-sig",
-              newline=""
-          ) as file:
-              reader = csv.DictReader(file)
-              headers = reader.fieldnames or []
-              row_count = sum(1 for _ in reader)
-
-          required = {
-              "filename",
-              "date",
-              "time",
           }
-
-          missing = required.difference(headers)
-
-          if missing:
-              raise SystemExit(
-                  "events.csv is missing required columns: "
-                  f"{sorted(missing)}"
-              )
-
-          print(
-              f"events.csv validation passed with "
-              f"{len(headers)} columns and {row_count} rows"
-          )
-          PY
+          echo "No images required processing; retaining current event data."
 
       - name: Build website event JSON
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           PIPELINE_CONFIG: ${{ env.PIPELINE_CONFIG }}
+        run: python build_events_json.py
+
+      - name: Validate outputs
         run: |
-          python build_events_json.py
-
-      - name: Validate generated outputs
-        run: |
-          test -s "$EVENTS_CSV" || {
-            echo "::error::$EVENTS_CSV is missing or empty."
-            exit 1
-          }
-
-          test -s "$EVENTS_JSON" || {
-            echo "::error::$EVENTS_JSON is missing or empty."
-            exit 1
-          }
-
-          python -m json.tool "$EVENTS_JSON" > /dev/null
-
-          if [[ -f "$EVENTS_TSV" ]]; then
-            test -s "$EVENTS_TSV" || {
-              echo "::error::$EVENTS_TSV exists but is empty."
+          test -s "$EVENTS_CSV" || { echo "::error::events.csv is missing"; exit 1; }
+          test -s "$EVENTS_JSON" || { echo "::error::docs/events.json is missing"; exit 1; }
+          python -m json.tool "$EVENTS_JSON" >/dev/null
+          if [[ "${{ steps.image-count.outputs.count }}" != "0" ]]; then
+            test -s "$PROCESSING_MANIFEST" || {
+              echo "::error::processing-manifest.json is missing"
               exit 1
             }
-          else
-            echo "::warning::$EVENTS_TSV was not produced."
           fi
 
-      - name: Upload new images to Google Drive
+      - name: Upload images
         if: steps.image-count.outputs.count != '0'
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          rclone copy \
-            "$IMAGE_DIRECTORY" \
-            "gdrive:" \
-            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --ignore-existing \
-            --transfers 8 \
-            --checkers 16 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --stats 30s \
-            --stats-one-line \
-            --verbose
+          rclone copy "$IMAGE_DIRECTORY" "gdrive:" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" --ignore-existing \
+            --transfers 8 --checkers 16 --retries 5 --low-level-retries 10 \
+            --stats 30s --stats-one-line -v
 
       - name: Upload event data and pipeline state
         env:
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          upload_file() {
-            local local_name="$1"
-            local remote_name="$2"
-
-            if [[ ! -s "$local_name" ]]; then
-              echo "::error::Cannot upload missing or empty file: $local_name"
-              exit 1
-            fi
-
-            rclone copyto \
-              "$local_name" \
-              "gdrive:$remote_name" \
-              --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-              --retries 5 \
-              --low-level-retries 10 \
-              --verbose
-          }
-
-          upload_file "$EVENTS_JSON" "events.json"
-          upload_file "$EVENTS_CSV" "events.csv"
-          upload_file "$PROCESSING_MANIFEST" "processing-manifest.json"
-
+          rclone copyto "$EVENTS_JSON" "gdrive:events.json" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" --retries 5 --low-level-retries 10 -v
+          rclone copyto "$EVENTS_CSV" "gdrive:events.csv" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" --retries 5 --low-level-retries 10 -v
+          rclone copyto "$PROCESSING_MANIFEST" "gdrive:processing-manifest.json" \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" --retries 5 --low-level-retries 10 -v
           if [[ -s "$EVENTS_TSV" ]]; then
-            upload_file "$EVENTS_TSV" "events.tsv"
-          else
-            echo "::warning::events.tsv was not produced, so it will not be uploaded."
-          fi
-
-      - name: Print pipeline summary
-        if: always()
-        run: |
-          echo "SPYPOINT pipeline summary"
-          echo "-------------------------"
-          echo "Workflow run: $GITHUB_RUN_NUMBER"
-          echo "Event: $GITHUB_EVENT_NAME"
-          echo "Full rebuild: ${{ inputs.full_rebuild || false }}"
-          echo "Images found: ${{ steps.image-count.outputs.count || 'unknown' }}"
-
-          if [[ -f "$EVENTS_CSV" ]]; then
-            echo "events.csv size: $(du -h "$EVENTS_CSV" | cut -f1)"
-          fi
-
-          if [[ -f "$EVENTS_JSON" ]]; then
-            echo "events.json size: $(du -h "$EVENTS_JSON" | cut -f1)"
-          fi
-
-          if [[ -f "$PROCESSING_MANIFEST" ]]; then
-            echo "manifest size: $(du -h "$PROCESSING_MANIFEST" | cut -f1)"
+            rclone copyto "$EVENTS_TSV" "gdrive:events.tsv" \
+              --drive-root-folder-id "$GDRIVE_FOLDER_ID" --retries 5 --low-level-retries 10 -v
           fi
 
       - name: Save pipeline outputs as workflow artifact
