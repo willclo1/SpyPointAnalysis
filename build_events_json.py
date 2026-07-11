@@ -11,12 +11,7 @@ from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-EVENTS_CSV = Path(os.environ.get("EVENTS_CSV", "events.csv"))
-OUT_JSON = Path(os.environ.get("EVENTS_JSON", "docs/events.json"))
-EVENT_GAP_MINUTES = int(os.environ.get("EVENT_GAP_MINUTES", "12"))
-MAX_ITEMS_PER_EVENT = int(os.environ.get("MAX_ITEMS_PER_EVENT", "80"))
-MIN_ITEMS_PER_EVENT = int(os.environ.get("MIN_ITEMS_PER_EVENT", "2"))
-RCLONE_WORKERS = int(os.environ.get("RCLONE_WORKERS", "4"))
+from config import PipelineConfig, load_config
 
 
 def _run_rclone_lsjson(camera: str, root_folder_id: str) -> List[dict]:
@@ -35,10 +30,10 @@ def _run_rclone_lsjson(camera: str, root_folder_id: str) -> List[dict]:
     return value if isinstance(value, list) else []
 
 
-def build_drive_index(cameras: Iterable[str], root_folder_id: str) -> Dict[str, Dict[str, str]]:
+def build_drive_index(cameras: Iterable[str], root_folder_id: str, workers_requested: int) -> Dict[str, Dict[str, str]]:
     camera_list = sorted(set(cameras))
     index: Dict[str, Dict[str, str]] = {}
-    workers = max(1, min(RCLONE_WORKERS, len(camera_list) or 1))
+    workers = max(1, min(workers_requested, len(camera_list) or 1))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_run_rclone_lsjson, camera, root_folder_id): camera for camera in camera_list}
@@ -54,11 +49,11 @@ def build_drive_index(cameras: Iterable[str], root_folder_id: str) -> Dict[str, 
     return index
 
 
-def _load_events() -> pd.DataFrame:
-    if not EVENTS_CSV.exists():
-        raise SystemExit(f"Missing {EVENTS_CSV}")
+def _load_events(events_csv: Path) -> pd.DataFrame:
+    if not events_csv.exists():
+        raise SystemExit(f"Missing {events_csv}")
 
-    frame = pd.read_csv(EVENTS_CSV, dtype=str, keep_default_na=False)
+    frame = pd.read_csv(events_csv, dtype=str, keep_default_na=False)
     required = {"camera", "filename", "date", "time", "event_type", "species_clean"}
     missing = sorted(required - set(frame.columns))
     if missing:
@@ -105,15 +100,16 @@ def _stable_event_id(camera: str, start: pd.Timestamp, filenames: Iterable[str])
     return hashlib.sha1(payload).hexdigest()[:16]
 
 
-def group_into_events(frame: pd.DataFrame) -> List[Dict[str, Any]]:
+def group_into_events(frame: pd.DataFrame, config: PipelineConfig) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
 
     for camera, camera_rows in frame.groupby("camera", sort=False):
         camera_rows = camera_rows.sort_values("datetime").reset_index(drop=True)
-        split_marker = camera_rows["datetime"].diff().dt.total_seconds().div(60).gt(EVENT_GAP_MINUTES).cumsum()
+        event_gap_minutes = config.camera(str(camera)).event_gap_minutes
+        split_marker = camera_rows["datetime"].diff().dt.total_seconds().div(60).gt(event_gap_minutes).cumsum()
 
         for _, burst in camera_rows.groupby(split_marker, sort=False):
-            if len(burst) < MIN_ITEMS_PER_EVENT:
+            if len(burst) < config.min_items_per_event:
                 continue
 
             burst = burst.sort_values("datetime")
@@ -121,7 +117,7 @@ def group_into_events(frame: pd.DataFrame) -> List[Dict[str, Any]]:
             start = burst["datetime"].iloc[0]
             end = burst["datetime"].iloc[-1]
             all_filenames = burst["filename"].astype(str).tolist()
-            shown = burst.head(MAX_ITEMS_PER_EVENT)
+            shown = burst.head(config.max_items_per_event)
 
             items = [
                 {
@@ -143,7 +139,8 @@ def group_into_events(frame: pd.DataFrame) -> List[Dict[str, Any]]:
                 "end": end.isoformat(),
                 "duration_minutes": round((end - start).total_seconds() / 60, 1),
                 "count": len(burst),
-                "items_truncated": len(burst) > MAX_ITEMS_PER_EVENT,
+                "items_truncated": len(burst) > config.max_items_per_event,
+                "event_gap_minutes": event_gap_minutes,
                 "thumbnail_file_id": thumbnail_id,
                 "items": items,
             })
@@ -161,23 +158,25 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 
 
 def main() -> None:
+    config = load_config()
     root_folder_id = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
     if not root_folder_id:
         raise SystemExit("Set GDRIVE_FOLDER_ID")
 
-    frame = _load_events()
-    drive_index = build_drive_index(frame["camera"].tolist(), root_folder_id)
+    frame = _load_events(config.events_csv)
+    drive_index = build_drive_index(frame["camera"].tolist(), root_folder_id, config.rclone_workers)
     frame["file_id"] = [drive_index.get(camera, {}).get(filename, "") for camera, filename in zip(frame["camera"], frame["filename"])]
 
-    events = group_into_events(frame)
-    _atomic_write_json(OUT_JSON, {
-        "schema_version": 2,
-        "event_gap_minutes": EVENT_GAP_MINUTES,
+    events = group_into_events(frame, config)
+    _atomic_write_json(config.events_json, {
+        "schema_version": 3,
+        "pipeline_version": config.pipeline_version,
+        "default_event_gap_minutes": config.default_camera.event_gap_minutes,
         "events": events,
     })
 
     missing_ids = sum(not item["file_id"] for event in events for item in event["items"])
-    print(f"[OK] Wrote {OUT_JSON}: {len(events)} events")
+    print(f"[OK] Wrote {config.events_json}: {len(events)} events")
     print(f"[OK] Missing Drive IDs: {missing_ids}")
 
 

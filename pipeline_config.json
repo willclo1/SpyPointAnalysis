@@ -1,0 +1,31 @@
+{
+  "pipeline_version": "3.0.0",
+  "images_dir": "images",
+  "events_csv": "events.csv",
+  "events_tsv": "events.tsv",
+  "events_json": "docs/events.json",
+  "speciesnet_json": "speciesnet-results.json",
+  "manifest_path": "processing-manifest.json",
+  "speciesnet_country": "USA",
+  "speciesnet_admin1": "TX",
+  "reuse_speciesnet": true,
+  "max_items_per_event": 80,
+  "min_items_per_event": 2,
+  "rclone_workers": 4,
+  "default_camera": {
+    "event_gap_minutes": 12,
+    "animal_threshold": 0.2,
+    "human_threshold": 0.3,
+    "vehicle_threshold": 0.3,
+    "species_strong_threshold": 0.6,
+    "species_fallback_threshold": 0.35,
+    "ocr_crop_fraction": 0.3,
+    "timezone": "America/Chicago"
+  },
+  "cameras": {
+    "Front Gate": {
+      "event_gap_minutes": 8,
+      "vehicle_threshold": 0.25
+    }
+  }
+}

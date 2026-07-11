@@ -92,10 +92,10 @@ def _detect_text(content: bytes) -> str:
     return (response.full_text_annotation.text or "").strip()
 
 
-def ocr_spypoint_stamp_vision(image_path: str) -> Stamp:
+def ocr_spypoint_stamp_vision(image_path: str, crop_fraction: float = 0.30) -> Stamp:
     """OCR only the bottom stamp region first, then retry the full image if needed."""
     try:
-        cropped_text = _detect_text(_read_stamp_crop(image_path))
+        cropped_text = _detect_text(_read_stamp_crop(image_path, crop_fraction=crop_fraction))
         stamp = _parse_stamp(cropped_text)
         if stamp.date_mmddyyyy and stamp.time_hhmm_ampm:
             return stamp
