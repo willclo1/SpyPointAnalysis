@@ -77,14 +77,30 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade "pip<26" "setuptools==80.9.0" wheel
+
           python -m pip install --only-binary=:all: \
-            "onnx==1.16.2" "protobuf<5" "blake3==1.0.8" "asn1crypto==1.5.1"
+            "onnx==1.16.2" \
+            "protobuf<5" \
+            "blake3==1.0.8" \
+            "asn1crypto==1.5.1"
+
           python -m pip install -r requirements.txt
+
+          # requirements.txt may contain an old SpeciesNet package.
+          # Force the current complete release after all other dependencies.
+          python -m pip uninstall --yes speciesnet
+          python -m pip install --no-cache-dir --upgrade \
+            "speciesnet==5.0.5"
 
       - name: Verify Python environment
         run: |
+          python --version
+          python -m pip show speciesnet
+
           python - <<'PY'
-          import pkg_resources
+          import importlib.util
+          import pathlib
+
           import cv2
           import numpy
           import pandas
@@ -92,8 +108,22 @@ jobs:
           import speciesnet
           import google.cloud.vision
           import astral
+
+          module = importlib.util.find_spec("speciesnet.scripts.run_model")
+
+          print("SpeciesNet package:", speciesnet.__file__)
+          print("SpeciesNet version module path:", pathlib.Path(speciesnet.__file__).parent)
+
+          if module is None:
+              raise RuntimeError(
+                  "speciesnet.scripts.run_model is missing from the installed package"
+              )
+
+          print("SpeciesNet run_model:", module.origin)
           print("Python dependency verification passed")
           PY
+
+          python -m speciesnet.scripts.run_model --help
 
       - name: Install rclone
         run: |
