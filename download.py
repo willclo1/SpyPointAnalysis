@@ -8,6 +8,8 @@ from pathlib import Path
 from datetime import datetime, date, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import spypoint
 
 try:
@@ -44,6 +46,9 @@ START_DATE_ENV = os.environ.get("START_DATE", "").strip()
 END_DATE_ENV = os.environ.get("END_DATE", "").strip()
 
 OUT_DIR = Path("images")
+
+HTTP = requests.Session()
+HTTP.mount("https://", HTTPAdapter(max_retries=Retry(total=4, connect=4, read=4, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset({"GET"}))))
 
 
 # -----------------------------
@@ -180,11 +185,11 @@ def resolve_date_window() -> tuple[date, date]:
     return start, end
 
 
-def in_date_window(photo) -> bool:
-    dt = photo_datetime(photo)
-    if not dt:
+def in_date_window(photo=None, *, dt: datetime | None = None) -> bool:
+    value = dt if dt is not None else photo_datetime(photo)
+    if not value:
         return False if SKIP_IF_NO_DATE else True
-    d = _to_local_date(dt)
+    d = _to_local_date(value)
     return WINDOW_START <= d <= WINDOW_END
 
 
@@ -227,9 +232,19 @@ def drive_existing_filenames(root_folder_id: str, cam_folder: str) -> set[str]:
 # IO
 # -----------------------------
 def download(url: str, out_path: Path) -> None:
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    out_path.write_bytes(r.content)
+    temporary = out_path.with_suffix(out_path.suffix + ".part")
+    try:
+        with HTTP.get(url, timeout=(10, 90), stream=True) as response:
+            response.raise_for_status()
+            with temporary.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        handle.write(chunk)
+        if temporary.stat().st_size == 0:
+            raise RuntimeError("Downloaded file was empty")
+        temporary.replace(out_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def upload_to_drive(local_path: Path, root_folder_id: str, cam_folder: str, filename: str) -> None:
@@ -311,7 +326,7 @@ def main():
                 skipped_no_date += 1
                 continue
 
-            if not in_date_window(p):
+            if not in_date_window(dt=dt):
                 skipped_outside_window += 1
                 continue
 
@@ -334,6 +349,7 @@ def main():
                 download(url, out_path)
                 upload_to_drive(out_path, root_folder_id, folder, filename)
             except Exception as e:
+                out_path.unlink(missing_ok=True)
                 print(f"[ERROR] {folder}/{filename}: {e}")
                 continue
 

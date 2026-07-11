@@ -1,243 +1,184 @@
+from __future__ import annotations
+
+import hashlib
 import json
 import os
 import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 
-# -----------------------
-# Config
-# -----------------------
-EVENTS_CSV = Path("events.csv")          # your workflow downloads this
-OUT_JSON = Path("docs/events.json")      # output for your site
-EVENT_GAP_MINUTES = 12                   # split events if gap exceeds this
-MAX_ITEMS_PER_EVENT = 80                 # safety cap for huge bursts
+EVENTS_CSV = Path(os.environ.get("EVENTS_CSV", "events.csv"))
+OUT_JSON = Path(os.environ.get("EVENTS_JSON", "docs/events.json"))
+EVENT_GAP_MINUTES = int(os.environ.get("EVENT_GAP_MINUTES", "12"))
+MAX_ITEMS_PER_EVENT = int(os.environ.get("MAX_ITEMS_PER_EVENT", "80"))
+MIN_ITEMS_PER_EVENT = int(os.environ.get("MIN_ITEMS_PER_EVENT", "2"))
+RCLONE_WORKERS = int(os.environ.get("RCLONE_WORKERS", "4"))
 
 
-def run_rclone_lsjson(cam_folder: str, root_folder_id: str) -> List[dict]:
-    """
-    Lists files in gdrive:<cam_folder> and returns rclone lsjson output.
-    For Google Drive, rclone includes "ID" for files.
-    """
-    cmd = [
-        "rclone",
-        "lsjson",
-        f"gdrive:{cam_folder}",
-        "--drive-root-folder-id",
-        root_folder_id,
+def _run_rclone_lsjson(camera: str, root_folder_id: str) -> List[dict]:
+    command = [
+        "rclone", "lsjson", f"gdrive:{camera}",
+        "--drive-root-folder-id", root_folder_id,
+        "--files-only",
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        return []
-    out = (p.stdout or "").strip()
-    if not out:
-        return []
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"rclone failed for {camera}: {(result.stderr or '').strip()}")
     try:
-        return json.loads(out)
-    except Exception:
-        return []
+        value = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"rclone returned invalid JSON for {camera}") from exc
+    return value if isinstance(value, list) else []
 
 
-def build_drive_index(cameras: List[str], root_folder_id: str) -> Dict[str, Dict[str, str]]:
-    """
-    Returns:
-      { camera: { filename: file_id } }
-    """
+def build_drive_index(cameras: Iterable[str], root_folder_id: str) -> Dict[str, Dict[str, str]]:
+    camera_list = sorted(set(cameras))
     index: Dict[str, Dict[str, str]] = {}
-    for cam in cameras:
-        items = run_rclone_lsjson(cam, root_folder_id)
-        m: Dict[str, str] = {}
-        for it in items:
-            if it.get("IsDir"):
-                continue
-            name = it.get("Name")
-            fid = it.get("ID") or it.get("Id")
-            if name and fid:
-                m[str(name)] = str(fid)
-        index[cam] = m
-        print(f"[DriveIndex] {cam}: {len(m)} files")
+    workers = max(1, min(RCLONE_WORKERS, len(camera_list) or 1))
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_run_rclone_lsjson, camera, root_folder_id): camera for camera in camera_list}
+        for future in as_completed(futures):
+            camera = futures[future]
+            items = future.result()
+            index[camera] = {
+                str(item["Name"]): str(item.get("ID") or item.get("Id"))
+                for item in items
+                if item.get("Name") and (item.get("ID") or item.get("Id"))
+            }
+            print(f"[DriveIndex] {camera}: {len(index[camera])} files")
     return index
 
 
-def parse_datetime_from_date_time(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Your CSV uses:
-      date: "01/23/2026"
-      time: "03:00 AM"
-    """
-    df = df.copy()
-    dt = pd.to_datetime(
-        df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip(),
+def _load_events() -> pd.DataFrame:
+    if not EVENTS_CSV.exists():
+        raise SystemExit(f"Missing {EVENTS_CSV}")
+
+    frame = pd.read_csv(EVENTS_CSV, dtype=str, keep_default_na=False)
+    required = {"camera", "filename", "date", "time", "event_type", "species_clean"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"events.csv is missing required columns: {', '.join(missing)}")
+
+    frame["datetime"] = pd.to_datetime(
+        frame["date"].str.strip() + " " + frame["time"].str.strip(),
         format="%m/%d/%Y %I:%M %p",
         errors="coerce",
     )
-    df["datetime"] = dt
-    return df
+    frame["event_type"] = frame["event_type"].str.strip().str.lower()
+    frame["camera"] = frame["camera"].str.strip()
+    frame["filename"] = frame["filename"].str.strip()
+    frame["species_clean"] = frame["species_clean"].str.strip()
+    frame["species_conf_num"] = pd.to_numeric(frame.get("species_conf", "0"), errors="coerce").fillna(0.0)
+
+    frame = frame[
+        (frame["event_type"] == "animal")
+        & frame["datetime"].notna()
+        & frame["camera"].ne("")
+        & frame["filename"].ne("")
+        & frame["species_clean"].ne("")
+        & frame["species_clean"].str.lower().ne("other")
+    ].copy()
+
+    # Keep one row per physical image, preferring the row with the strongest species score.
+    frame = frame.sort_values("species_conf_num", ascending=False).drop_duplicates(["camera", "filename"])
+    return frame.sort_values(["camera", "datetime", "filename"]).reset_index(drop=True)
 
 
-def filter_to_curated_wildlife(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply your rules:
-    - discard human / vehicle / blank
-    - discard species_clean == Other
-    """
-    df = df.copy()
-
-    df["event_type"] = df["event_type"].astype(str).str.strip().str.lower()
-    df = df[df["event_type"] == "animal"]
-
-    # Species column in your file is species_clean (use that for UI)
-    if "species_clean" not in df.columns:
-        raise ValueError("Expected column 'species_clean' in events.csv")
-
-    df["species_clean"] = df["species_clean"].astype(str).str.strip()
-    df = df[df["species_clean"].notna()]
-    df = df[df["species_clean"] != ""]
-    df = df[df["species_clean"].str.lower() != "other"]
-
-    # Require key fields
-    df["camera"] = df["camera"].astype(str).str.strip()
-    df["filename"] = df["filename"].astype(str).str.strip()
-    df = df[(df["camera"] != "") & (df["filename"] != "")]
-
-    # Require datetime
-    df = df.dropna(subset=["datetime"])
-
-    return df
+def _dominant_species(group: pd.DataFrame) -> str:
+    scores: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for row in group.itertuples(index=False):
+        species = str(row.species_clean)
+        confidence = max(float(row.species_conf_num), 0.05)
+        scores[species] = scores.get(species, 0.0) + confidence
+        counts[species] = counts.get(species, 0) + 1
+    return max(scores, key=lambda species: (scores[species], counts[species], species))
 
 
-def group_into_events(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Groups by (camera, species_clean) and splits into events by time gaps.
-    Then removes events of size 1 (your requirement).
-    """
-    df = df.sort_values(["camera", "species_clean", "datetime"]).reset_index(drop=True)
+def _stable_event_id(camera: str, start: pd.Timestamp, filenames: Iterable[str]) -> str:
+    payload = f"{camera}|{start.isoformat()}|{'|'.join(filenames)}".encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:16]
 
+
+def group_into_events(frame: pd.DataFrame) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
 
-    for (cam, species), g in df.groupby(["camera", "species_clean"], sort=False):
-        g = g.sort_values("datetime").reset_index(drop=True)
+    for camera, camera_rows in frame.groupby("camera", sort=False):
+        camera_rows = camera_rows.sort_values("datetime").reset_index(drop=True)
+        split_marker = camera_rows["datetime"].diff().dt.total_seconds().div(60).gt(EVENT_GAP_MINUTES).cumsum()
 
-        current: List[Tuple[pd.Timestamp, str, str]] = []  # (dt, filename, file_id)
-        start_dt: Optional[pd.Timestamp] = None
-        last_dt: Optional[pd.Timestamp] = None
-
-        def flush():
-            nonlocal current, start_dt, last_dt
-            if not current or start_dt is None or last_dt is None:
-                return
-
-            # DROP size 1 events (your requirement)
-            if len(current) <= 1:
-                current = []
-                start_dt = None
-                last_dt = None
-                return
-
-            # cap items if huge burst
-            items = current[:MAX_ITEMS_PER_EVENT]
-
-            # pick thumb as first item with file_id (if any)
-            thumb_id = ""
-            for _, _, fid in items:
-                if fid:
-                    thumb_id = fid
-                    break
-
-            event_id = f"{cam}|{species}|{start_dt.isoformat(timespec='minutes')}"
-
-            events.append(
-                {
-                    "event_id": event_id,
-                    "camera": cam,
-                    "species": species,
-                    "start": start_dt.isoformat(),
-                    "end": last_dt.isoformat(),
-                    "count": len(current),
-                    "thumbnail_file_id": thumb_id,  # your site can build thumb URL from this
-                    "items": [
-                        {
-                            "datetime": dt.isoformat(),
-                            "filename": fn,
-                            "file_id": fid,
-                        }
-                        for dt, fn, fid in items
-                    ],
-                }
-            )
-
-            current = []
-            start_dt = None
-            last_dt = None
-
-        for _, r in g.iterrows():
-            dt: pd.Timestamp = r["datetime"]
-            fn: str = str(r["filename"])
-            fid: str = str(r.get("file_id") or "")
-
-            if start_dt is None:
-                start_dt = dt
-                last_dt = dt
-                current = [(dt, fn, fid)]
+        for _, burst in camera_rows.groupby(split_marker, sort=False):
+            if len(burst) < MIN_ITEMS_PER_EVENT:
                 continue
 
-            gap_min = (dt - last_dt).total_seconds() / 60.0 if last_dt is not None else 0.0
-            if gap_min > EVENT_GAP_MINUTES:
-                flush()
-                start_dt = dt
-                last_dt = dt
-                current = [(dt, fn, fid)]
-            else:
-                current.append((dt, fn, fid))
-                last_dt = dt
+            burst = burst.sort_values("datetime")
+            species = _dominant_species(burst)
+            start = burst["datetime"].iloc[0]
+            end = burst["datetime"].iloc[-1]
+            all_filenames = burst["filename"].astype(str).tolist()
+            shown = burst.head(MAX_ITEMS_PER_EVENT)
 
-        flush()
+            items = [
+                {
+                    "datetime": row.datetime.isoformat(),
+                    "filename": str(row.filename),
+                    "file_id": str(row.file_id),
+                    "species": str(row.species_clean),
+                    "species_conf": round(float(row.species_conf_num), 3),
+                }
+                for row in shown.itertuples(index=False)
+            ]
+            thumbnail_id = next((item["file_id"] for item in items if item["file_id"]), "")
 
-    # newest first
-    events.sort(key=lambda e: e["start"], reverse=True)
-    return events
+            events.append({
+                "event_id": _stable_event_id(str(camera), start, all_filenames),
+                "camera": str(camera),
+                "species": species,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "duration_minutes": round((end - start).total_seconds() / 60, 1),
+                "count": len(burst),
+                "items_truncated": len(burst) > MAX_ITEMS_PER_EVENT,
+                "thumbnail_file_id": thumbnail_id,
+                "items": items,
+            })
+
+    return sorted(events, key=lambda event: event["start"], reverse=True)
 
 
-def main():
-    if not EVENTS_CSV.exists():
-        raise SystemExit(f"Missing {EVENTS_CSV}. (Your workflow should download it from Drive first.)")
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.replace(path)
 
-    root_folder_id = os.environ.get("GDRIVE_FOLDER_ID")
+
+def main() -> None:
+    root_folder_id = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
     if not root_folder_id:
-        raise SystemExit("Set GDRIVE_FOLDER_ID env var (Drive folder that contains your camera folders).")
+        raise SystemExit("Set GDRIVE_FOLDER_ID")
 
-    df = pd.read_csv(EVENTS_CSV)
+    frame = _load_events()
+    drive_index = build_drive_index(frame["camera"].tolist(), root_folder_id)
+    frame["file_id"] = [drive_index.get(camera, {}).get(filename, "") for camera, filename in zip(frame["camera"], frame["filename"])]
 
-    # Build datetime from your real columns
-    if "date" not in df.columns or "time" not in df.columns:
-        raise ValueError(f"events.csv must have 'date' and 'time' columns. Found: {list(df.columns)}")
-    df = parse_datetime_from_date_time(df)
+    events = group_into_events(frame)
+    _atomic_write_json(OUT_JSON, {
+        "schema_version": 2,
+        "event_gap_minutes": EVENT_GAP_MINUTES,
+        "events": events,
+    })
 
-    # Curate: wildlife only, no Other
-    df = filter_to_curated_wildlife(df)
-
-    # Build Drive index so we can attach file IDs for thumbnails
-    cameras = sorted(df["camera"].dropna().unique().tolist())
-    drive_index = build_drive_index(cameras, root_folder_id)
-
-    # Attach file_id to each row
-    df["file_id"] = df.apply(
-        lambda r: drive_index.get(r["camera"], {}).get(r["filename"], ""),
-        axis=1,
-    )
-
-    # Group into events; drops size-1 events
-    events = group_into_events(df)
-
-    OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    OUT_JSON.write_text(json.dumps({"events": events}, indent=2), encoding="utf-8")
-
-    # quick summary
-    total_items = sum(e["count"] for e in events)
-    missing_ids = sum(1 for e in events for it in e["items"] if not it.get("file_id"))
-    print(f"[OK] Wrote {OUT_JSON} with {len(events)} events, {total_items} items")
-    print(f"[OK] Missing Drive IDs for {missing_ids} items (those will not have thumbnails)")
+    missing_ids = sum(not item["file_id"] for event in events for item in event["items"])
+    print(f"[OK] Wrote {OUT_JSON}: {len(events)} events")
+    print(f"[OK] Missing Drive IDs: {missing_ids}")
 
 
 if __name__ == "__main__":

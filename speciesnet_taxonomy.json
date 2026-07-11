@@ -1,1 +1,4 @@
-404: Not Found
+{
+  "status": "placeholder",
+  "note": "The uploaded file contained only '404: Not Found'. This valid JSON placeholder prevents parse failures; replace it with the official taxonomy only if another script explicitly consumes it."
+}

@@ -1,4 +1,6 @@
-# edit_run_events_append.py
+from __future__ import annotations
+
+# run_events_append.py
 import csv
 import json
 import os
@@ -21,9 +23,9 @@ UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING") == "1"
 FULL_REBUILD = os.environ.get("FULL_REBUILD") == "1"
 
 # thresholds (detections come from SpeciesNet output)
-ANIMAL_THRESH = 0.20
-HUMAN_THRESH = 0.30
-VEHICLE_THRESH = 0.30
+ANIMAL_THRESH = float(os.environ.get("ANIMAL_THRESH", "0.20"))
+HUMAN_THRESH = float(os.environ.get("HUMAN_THRESH", "0.30"))
+VEHICLE_THRESH = float(os.environ.get("VEHICLE_THRESH", "0.30"))
 
 CAT_ANIMAL = "1"
 CAT_HUMAN = "2"
@@ -31,7 +33,8 @@ CAT_VEHICLE = "3"
 
 # Species selection thresholds
 PRIMARY_SPECIES_MIN = float(os.environ.get("SPECIES_STRONG_THRESH", "0.60"))  # allow override
-SECONDARY_MIN = 0.35  # fallback so we don't throw everything to Other/Unknown
+SECONDARY_MIN = float(os.environ.get("SPECIES_FALLBACK_THRESH", "0.35"))
+REUSE_SPECIESNET = os.environ.get("REUSE_SPECIESNET") == "1"  # fallback so we don't throw everything to Other/Unknown
 
 FIELDS = [
     "camera",
@@ -132,7 +135,9 @@ def run_speciesnet(images_dir: Path, out_json: Path):
     if admin1:
         cmd += ["--admin1_region", admin1]
 
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"SpeciesNet failed: {(result.stderr or result.stdout).strip()}")
 
 
 def max_conf_for_category(dets: List[dict], category: str) -> float:
@@ -255,11 +260,17 @@ def main():
     if not IMAGES_DIR.exists():
         raise SystemExit("Missing images folder")
 
-    # Run SpeciesNet once for the whole folder
-    run_speciesnet(IMAGES_DIR, SPECIESNET_JSON)
+    # Reuse cached predictions when explicitly requested.
+    if not (REUSE_SPECIESNET and SPECIESNET_JSON.exists()):
+        run_speciesnet(IMAGES_DIR, SPECIESNET_JSON)
+    else:
+        print(f"Reusing {SPECIESNET_JSON}")
 
-    with SPECIESNET_JSON.open("r") as f:
-        sn = json.load(f)
+    try:
+        with SPECIESNET_JSON.open("r", encoding="utf-8") as f:
+            sn = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read {SPECIESNET_JSON}: {exc}") from exc
 
     preds = sn.get("predictions", []) or []
 
@@ -284,7 +295,10 @@ def main():
     
     added, updated = 0, 0
 
-    for img_path in sorted(IMAGES_DIR.rglob("*.jpg")):
+    image_paths = sorted(p for p in IMAGES_DIR.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+    ocr_failures = 0
+
+    for img_path in image_paths:
         fn = img_path.name
         camera = img_path.parent.name if img_path.parent != IMAGES_DIR else "unknown"
         key = row_key(camera, fn)
@@ -293,7 +307,13 @@ def main():
         if key in existing and not UPDATE_EXISTING and not FULL_REBUILD:
             continue
 
-        stamp = ocr_spypoint_stamp_vision(str(img_path))
+        try:
+            stamp = ocr_spypoint_stamp_vision(str(img_path))
+        except RuntimeError as exc:
+            print(f"[OCR ERROR] {img_path}: {exc}")
+            ocr_failures += 1
+            from vision_ocr import Stamp
+            stamp = Stamp(None, None, None, None, "")
         moon_phase, moon_illum, moon_age = compute_moon_fields(stamp)
 
         rel_key = str(img_path.resolve().relative_to(IMAGES_DIR.resolve()))
@@ -389,7 +409,7 @@ def main():
     write_table(OUT_TSV, all_rows, delimiter="\t")
 
     print(f"Wrote {OUT_CSV} and {OUT_TSV} with {len(all_rows)} rows")
-    print(f"Added {added}, updated {updated}")
+    print(f"Added {added}, updated {updated}, OCR failures {ocr_failures}")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,13 @@
 pyspypoint
-requests
-google-cloud-vision
-
-opencv-python
-pillow
-numpy
-pandas
-
-# Force modern ONNX wheel
+requests>=2.32,<3
+google-cloud-vision>=3.10,<4
+astral>=3.2,<4
+opencv-python-headless>=4.10,<5
+pillow>=10.4,<12
+numpy>=1.26,<3
+pandas>=2.2,<3
 onnx==1.16.2
-protobuf<5
-
+protobuf>=4.25,<5
 megadetector
 speciesnet
+pytest>=8,<9

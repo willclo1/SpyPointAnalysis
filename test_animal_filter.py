@@ -1,17 +1,12 @@
+from animal_filter import _intersection_ratio, _matches
 
-from pathlib import Path
-from pathlib import Path
-from animal_filter import decide_keep
 
-IMAGES = Path("images")
+def test_keyword_matching_uses_word_boundaries():
+    assert _matches("golf cart", {"golf cart"})
+    assert _matches("pickup truck", {"truck"})
+    assert not _matches("cardinal", {"car"})
 
-for p in sorted(IMAGES.glob("*.jpg")):
-    dec = decide_keep(str(p))
-    print("-" * 60)
-    print(p.name)
-    print("  KEEP:", dec.keep)
-    print("  REASON:", dec.reason)
-    print("  ALL OBJECTS:", [(d.name, round(d.score, 2)) for d in dec.all_objects])
-    print("  ANIMALS:", [(d.name, round(d.score, 2)) for d in dec.animals])
-    print("  VEHICLES_AT_GATE:", [(d.name, round(d.score, 2)) for d in dec.vehicles_at_gate])
-    print("  PEOPLE_AT_GATE:", [(d.name, round(d.score, 2)) for d in dec.people_at_gate])
+
+def test_gate_intersection_is_relative_to_object():
+    assert _intersection_ratio((0.5, 0.5, 0.7, 0.7), (0.35, 0.25, 0.98, 0.95)) == 1.0
+    assert _intersection_ratio((0.0, 0.0, 0.1, 0.1), (0.35, 0.25, 0.98, 0.95)) == 0.0
