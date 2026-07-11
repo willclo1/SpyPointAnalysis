@@ -26,9 +26,9 @@ CAMERA_NAME_MAP = {
 }
 
 # --- Tuning ---
-POLL_LIMIT = 250          # lookback window from SpyPoint API (we hard-filter by dates anyway)
-MAX_NEW_PER_RUN = 400     # cap across all cameras
-SLEEP_SEC = 0.2
+POLL_LIMIT = int(os.environ.get("POLL_LIMIT", "5000"))
+MAX_NEW_PER_RUN = int(os.environ.get("MAX_NEW_PER_RUN", "5000"))
+SLEEP_SEC = float(os.environ.get("DOWNLOAD_SLEEP_SEC", "0.2"))
 
 # Full mode (within date window): re-download + re-upload even if already in Drive
 FULL_REDOWNLOAD = os.environ.get("FULL_REDOWNLOAD") == "1"
