@@ -207,7 +207,7 @@ jobs:
           START_DATE: ${{ inputs.backfill_start || '' }}
           END_DATE: ${{ inputs.backfill_end || '' }}
           FULL_REDOWNLOAD: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '1' || '0' }}
-          POLL_LIMIT: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '5000' || '250' }}
+          POLL_LIMIT: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '5000' || '1000' }}
           MAX_NEW_PER_RUN: ${{ (inputs.backfill_start != '' && inputs.backfill_end != '') && '5000' || '400' }}
           LOCAL_TZ: "America/Chicago"
         run: python download.py

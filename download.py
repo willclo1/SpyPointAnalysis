@@ -5,7 +5,7 @@ import time
 import shutil
 import subprocess
 from pathlib import Path
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -41,9 +41,16 @@ LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ", "America/Chicago")
 LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME) if ZoneInfo else None
 
 # Optional date range
-# If neither is set => today-only
+# If neither is set => rolling look-back window ending today.
 START_DATE_ENV = os.environ.get("START_DATE", "").strip()
 END_DATE_ENV = os.environ.get("END_DATE", "").strip()
+
+# Default daily look-back (in local days) when no explicit range is given.
+# 1 => [yesterday, today], which guarantees a full night of nocturnal activity
+# is captured: photos from last evening are dated to yesterday (local), so a
+# today-only window would drop them permanently. Drive dedupe makes the extra
+# day cheap (already-uploaded files are skipped).
+DEFAULT_LOOKBACK_DAYS = int(os.environ.get("DEFAULT_LOOKBACK_DAYS", "1"))
 
 OUT_DIR = Path("images")
 
@@ -160,7 +167,8 @@ def parse_date_env(s: str) -> date | None:
 def resolve_date_window() -> tuple[date, date]:
     """
     Safety-first policy:
-    - If neither START_DATE nor END_DATE set: window is [today, today]
+    - If neither START_DATE nor END_DATE set: rolling window
+      [today - DEFAULT_LOOKBACK_DAYS, today] (defaults to [yesterday, today])
     - If START_DATE set but END_DATE not: window is [START_DATE, today]
     - If END_DATE set but START_DATE not: window is [END_DATE, END_DATE]
     - If both set: [START_DATE, END_DATE]
@@ -170,7 +178,8 @@ def resolve_date_window() -> tuple[date, date]:
     end = parse_date_env(END_DATE_ENV)
 
     if start is None and end is None:
-        return today, today
+        lookback = max(0, DEFAULT_LOOKBACK_DAYS)
+        return today - timedelta(days=lookback), today
 
     if start is not None and end is None:
         return start, today
@@ -285,7 +294,7 @@ def main():
     if START_DATE_ENV or END_DATE_ENV:
         print("[MODE] Date range requested via START_DATE/END_DATE")
     else:
-        print("[MODE] Default: today-only (no START_DATE/END_DATE set)")
+        print(f"[MODE] Default: rolling {DEFAULT_LOOKBACK_DAYS}-day look-back (no START_DATE/END_DATE set)")
 
     if FULL_REDOWNLOAD:
         print("[MODE] FULL_REDOWNLOAD=1 (re-upload within date window, ignore Drive existence checks)")
